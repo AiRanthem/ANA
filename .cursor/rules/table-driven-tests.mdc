@@ -1,0 +1,56 @@
+---
+description: Go tests must use table-driven cases with t.Run subtests when multiple scenarios exist
+globs: "**/*_test.go"
+alwaysApply: false
+---
+
+# Table-driven tests (Go)
+
+When a test covers **more than one scenario** (different inputs, outputs, modes, or error cases), express it as **table-driven tests**: a slice of named cases, `for` + `t.Run`, shared setup once outside the loop.
+
+## Required shape
+
+- Define a `tests := []struct { ... }{ ... }` (or separate named type) with at least `name string` and the fields needed for inputs/expectations.
+- Iterate with `for _, tt := range tests { t.Run(tt.name, func(t *testing.T) { ... }) }`.
+- Call `t.Helper()` in helpers used from subtests when appropriate.
+
+## Single-scenario tests
+
+A test function that validates **exactly one** fixed scenario may stay linear (no slice). As soon as you add a second case, convert to a table.
+
+## Examples
+
+```go
+// BAD: duplicated scenarios without a table
+func TestParse(t *testing.T) {
+	if _, err := Parse("a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(""); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+// GOOD: table + subtests
+func TestParse(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{name: "valid", in: "a", wantErr: false},
+		{name: "empty", in: "", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Parse(%q): err=%v, wantErr=%v", tt.in, err, tt.wantErr)
+			}
+		})
+	}
+}
+```
+
+- Prefer shared setup **before** the loop; use `t.Parallel()` only when cases are safe to run concurrently.
+- Keep expected values in the table; avoid branching on `tt.name` inside the subtest body—add fields to the struct instead.

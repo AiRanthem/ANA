@@ -20,13 +20,18 @@ type contextKey struct{}
 
 var loggerKey contextKey
 
-var defaultLogger atomic.Value // Logger
+// loggerHolder gives [atomic.Value] a single concrete type (*loggerHolder) while holding any [Logger].
+type loggerHolder struct {
+	Logger
+}
+
+var defaultLogger atomic.Value // *loggerHolder
 
 var exitFunc = os.Exit
 
 // Default returns the package-level default logger.
 func Default() Logger {
-	return defaultLogger.Load().(Logger)
+	return defaultLogger.Load().(*loggerHolder).Logger
 }
 
 // SetDefault replaces the package-level default logger. It panics if logger is nil.
@@ -34,7 +39,7 @@ func SetDefault(logger Logger) {
 	if logger == nil {
 		panic("logs: SetDefault(nil)")
 	}
-	defaultLogger.Store(logger)
+	defaultLogger.Store(&loggerHolder{Logger: logger})
 }
 
 // NewContext returns a new [context.Context] carrying fields merged into the default logger.
@@ -67,4 +72,8 @@ func FromContext(ctx context.Context) Logger {
 		return Default()
 	}
 	return l
+}
+
+func init() {
+	defaultLogger.Store(&loggerHolder{Logger: newDefaultLogger()})
 }

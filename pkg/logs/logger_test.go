@@ -213,6 +213,32 @@ func TestSetDefault_NilPanics(t *testing.T) {
 	SetDefault(nil)
 }
 
+// fakeLogger is a minimal [Logger] implementation distinct from *slogLogger.
+// Regression: [SetDefault] must accept any valid [Logger] without atomic.Value panicking.
+type fakeLogger struct {
+	debug, info bool
+}
+
+func (f *fakeLogger) Debug(string, ...any) { f.debug = true }
+func (f *fakeLogger) Info(string, ...any)  { f.info = true }
+func (f *fakeLogger) Warn(string, ...any)  {}
+func (f *fakeLogger) Error(string, ...any) {}
+func (f *fakeLogger) Fatal(string, ...any) {}
+func (f *fakeLogger) With(...any) Logger   { return f }
+
+func TestSetDefault_AcceptsNonSlogLogger(t *testing.T) {
+	prev := Default()
+	t.Cleanup(func() { SetDefault(prev) })
+
+	f := &fakeLogger{}
+	SetDefault(f)
+
+	Default().Info("x")
+	if !f.info {
+		t.Fatal("expected custom logger to receive Info")
+	}
+}
+
 func TestIntoContext_NilLoggerPanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {

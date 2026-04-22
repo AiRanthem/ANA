@@ -61,7 +61,3 @@ func newDefaultLogger() Logger {
 	})
 	return &slogLogger{log: slog.New(h)}
 }
-
-func init() {
-	defaultLogger.Store(newDefaultLogger())
-}
