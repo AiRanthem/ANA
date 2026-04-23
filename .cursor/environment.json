@@ -1,0 +1,4 @@
+{
+  "name": "ANA Go",
+  "install": "go mod download"
+}
