@@ -6,6 +6,10 @@
 - Keep rules minimal, practical, and easy to enforce in daily work.
 - If a more specific rule (package-level doc, directory-level `AGENTS.md`, or explicit user instruction) conflicts with this document, the more specific rule wins.
 
+## Git branches and commits
+
+A short always-on summary lives in `.cursor/rules/git-conventions.mdc`; full wording and examples are in `.cursor/rules/git-conventions.detail.mdc`.
+
 ## Style And Formatting
 - Always format code with `gofmt -s` (or `go fmt ./...`) and make sure `go vet ./...` is clean before committing.
 - Use clear, intention-revealing names; avoid abbreviations unless they are standard in Go.
