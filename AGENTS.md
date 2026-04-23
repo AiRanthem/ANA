@@ -6,6 +6,10 @@
 - Keep rules minimal, practical, and easy to enforce in daily work.
 - If a more specific rule (package-level doc, directory-level `AGENTS.md`, or explicit user instruction) conflicts with this document, the more specific rule wins.
 
+## Git branches and commits
+
+Branch naming, commit message wording, and signing requirements are defined in `.cursor/rules/git-conventions.mdc`. Read that file (or ensure it is in Cursor context via its `globs`) before creating branches, committing, or editing CI workflows.
+
 ## Style And Formatting
 - Always format code with `gofmt -s` (or `go fmt ./...`) and make sure `go vet ./...` is clean before committing.
 - Use clear, intention-revealing names; avoid abbreviations unless they are standard in Go.

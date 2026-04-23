@@ -1,11 +1,18 @@
 ---
 description: Branch naming, commit messages, and signing requirements for git work in this repo
-alwaysApply: true
+alwaysApply: false
+globs:
+  - ".cursor/rules/git-conventions.mdc"
+  - "AGENTS.md"
+  - ".cursor/environment.json"
+  - ".github/**/*.yml"
 ---
 
 # Git conventions
 
-Follow these rules for **every** git operation in this repository (local work, Cursor agents, and CI-related branches unless a maintainer overrides for automation).
+Cursor attaches this rule when files matching **`globs`** are in scope (for example open or referenced). It does **not** hook into `git checkout` / `git commit` automatically—when creating a branch or writing a commit message without touching those paths, rely on **`AGENTS.md`** or paste the conventions manually.
+
+Follow these rules for git operations in this repository (local work, Cursor agents, and CI-related branches unless a maintainer overrides for automation).
 
 ## Branch names
 
