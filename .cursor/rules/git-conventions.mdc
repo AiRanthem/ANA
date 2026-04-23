@@ -1,0 +1,40 @@
+---
+description: Branch naming, commit messages, and signing requirements for git work in this repo
+alwaysApply: true
+---
+
+# Git conventions
+
+Follow these rules for **every** git operation in this repository (local work, Cursor agents, and CI-related branches unless a maintainer overrides for automation).
+
+## Branch names
+
+Use this format only:
+
+`<type>/<content>-<date>`
+
+- **`type`**: Short category for the change (examples: `feature`, `fix`, `chore`, `refactor`; pick the closest match).
+- **`content`**: Brief, hyphenated slug describing the work (lowercase ASCII, avoid spaces).
+- **`date`**: Six digits **`YYMMDD`** (example: `260423` for 2026-04-23).
+
+Examples:
+
+- `feature/add-metrics-260423`
+- `fix/nil-pointer-parser-260423`
+- `chore/update-ci-260423`
+
+Do **not** use other prefixes (for example `cursor/` unless the team explicitly adopts them).
+
+## Commit messages
+
+1. Write messages that describe **only** the code change (what and why in plain language). No marketing or tool attribution.
+2. Do **not** include phrases such as **"Made with Cursor"**, **"Made with Codex"**, or similar agent/product footers anywhere in the subject or body.
+
+## Signed commits
+
+Commits **must** be cryptographically signed.
+
+- Prefer **SSH signing** (`git config gpg.format ssh` + `user.signingkey`) or **GPG signing** as documented in Git’s “Signing commits” guides.
+- Use `git commit -S` (capital S) when committing.
+
+If signing is not configured on a machine, configure it before pushing; do not bypass this requirement with `--no-gpg-sign` unless a repository maintainer explicitly allows an exception for a given automation path.
