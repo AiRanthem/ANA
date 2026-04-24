@@ -1,23 +1,24 @@
 # AGENTS.md
 
 ## Scope
-- `pkg/bridge` contains transport adapters only.
-- Subpackages are:
+- `pkg/bridge` is transport-only.
+- Keep transport implementations inside these subpackages:
   - `pkg/bridge/rest`
   - `pkg/bridge/cli`
   - `pkg/bridge/socket`
+- Canonical request, event, stream, and session contracts live in `pkg/agentio`.
 
 ## Responsibilities
-- Translate transport-specific payloads into `pkg/agentio` contracts.
-- Preserve semantics in `agentio.Event`.
-- Honor `context.Context` cancellation.
+- Translate transport payloads to and from `pkg/agentio`.
+- Preserve transport semantics when emitting `agentio.Event`.
+- Honor `context.Context` cancellation and clean shutdown.
 
 ## Non-Responsibilities
-- No canonical contract definitions.
+- No canonical contract definitions in `pkg/bridge`.
 - No routing, orchestration, transcript persistence, or call-chain assembly.
+- No new root-level helper files under `pkg/bridge`; keep helpers local to the transport subpackage that uses them.
 
-## Parallel Implementation Boundary
+## Parallel Boundary
 - One worker may own `pkg/bridge/rest`.
 - One worker may own `pkg/bridge/cli`.
 - One worker may own `pkg/bridge/socket`.
-- Any decode helpers stay inside `pkg/bridge/rest`, `pkg/bridge/cli`, or `pkg/bridge/socket`; do not add root-level helper files under `pkg/bridge`.
