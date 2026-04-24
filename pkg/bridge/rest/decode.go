@@ -35,8 +35,9 @@ func NewSSEStream(body io.ReadCloser) agentio.EventStream {
 		defer close(ch)
 		defer body.Close()
 
-		parseSSE(body, ch)
-		ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+		doneEmitted := false
+		parseSSE(body, ch, &doneEmitted)
+		emitDoneIfNeeded(ch, &doneEmitted)
 	}()
 	return agentio.NewChannelStream(ch, body.Close)
 }
@@ -48,8 +49,9 @@ func NewJSONLStream(body io.ReadCloser) agentio.EventStream {
 		defer close(ch)
 		defer body.Close()
 
-		parseJSONL(body, ch)
-		ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+		doneEmitted := false
+		parseJSONL(body, ch, &doneEmitted)
+		emitDoneIfNeeded(ch, &doneEmitted)
 	}()
 	return agentio.NewChannelStream(ch, body.Close)
 }
@@ -61,13 +63,14 @@ func NewSingleJSONResponseStream(body io.ReadCloser) agentio.EventStream {
 		defer close(ch)
 		defer body.Close()
 
-		parseSingleJSON(body, ch)
-		ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+		doneEmitted := false
+		parseSingleJSON(body, ch, &doneEmitted)
+		emitDoneIfNeeded(ch, &doneEmitted)
 	}()
 	return agentio.NewChannelStream(ch, body.Close)
 }
 
-func parseSSE(r io.Reader, ch chan<- agentio.Event) {
+func parseSSE(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
 
@@ -83,21 +86,21 @@ func parseSSE(r io.Reader, ch chan<- agentio.Event) {
 		switch data {
 		case "":
 		case "[DONE]":
-			ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+			emitEvent(ch, doneEmitted, agentio.Event{Type: agentio.EventDone, At: time.Now()})
 		default:
 			events, err := decodeFramedPayload(eventName, []byte(data))
 			if err != nil {
-				ch <- agentio.Event{
+				emitEvent(ch, doneEmitted, agentio.Event{
 					Type: agentio.EventFailure,
 					Err: &agentio.EventError{
 						Code:    "sse_decode_error",
 						Message: err.Error(),
 					},
 					At: time.Now(),
-				}
+				})
 			} else {
 				for _, event := range events {
-					ch <- event
+					emitEvent(ch, doneEmitted, event)
 				}
 			}
 		}
@@ -123,18 +126,18 @@ func parseSSE(r io.Reader, ch chan<- agentio.Event) {
 	flush()
 
 	if err := scanner.Err(); err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "sse_scan_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 	}
 }
 
-func parseJSONL(r io.Reader, ch chan<- agentio.Event) {
+func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
 
@@ -146,63 +149,77 @@ func parseJSONL(r io.Reader, ch chan<- agentio.Event) {
 
 		events, err := decodeFramedPayload("", []byte(line))
 		if err != nil {
-			ch <- agentio.Event{
+			emitEvent(ch, doneEmitted, agentio.Event{
 				Type: agentio.EventFailure,
 				Err: &agentio.EventError{
 					Code:    "jsonl_decode_error",
 					Message: err.Error(),
 				},
 				At: time.Now(),
-			}
+			})
 			continue
 		}
 		for _, event := range events {
-			ch <- event
+			emitEvent(ch, doneEmitted, event)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "jsonl_scan_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 	}
 }
 
-func parseSingleJSON(r io.Reader, ch chan<- agentio.Event) {
+func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	body, err := io.ReadAll(r)
 	if err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_read_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 		return
 	}
 
 	events, err := decodeFramedPayload("", body)
 	if err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_decode_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 		return
 	}
 
 	for _, event := range events {
-		ch <- event
+		emitEvent(ch, doneEmitted, event)
 	}
+}
+
+func emitDoneIfNeeded(ch chan<- agentio.Event, doneEmitted *bool) {
+	if doneEmitted != nil && *doneEmitted {
+		return
+	}
+	emitEvent(ch, doneEmitted, agentio.Event{Type: agentio.EventDone, At: time.Now()})
+}
+
+func emitEvent(ch chan<- agentio.Event, doneEmitted *bool, event agentio.Event) {
+	if doneEmitted != nil && event.Type == agentio.EventDone {
+		*doneEmitted = true
+	}
+	ch <- event
 }
 
 func decodeFramedPayload(name string, payload []byte) ([]agentio.Event, error) {

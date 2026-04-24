@@ -113,11 +113,12 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 	go func() {
 		defer close(ch)
 
+		doneEmitted := false
 		switch strings.ToLower(a.StdoutFormat) {
 		case "", "stream-json":
-			parseJSONL(stdout, ch)
+			parseJSONL(stdout, ch, &doneEmitted)
 		case "json":
-			parseSingleJSON(stdout, ch)
+			parseSingleJSON(stdout, ch, &doneEmitted)
 		case "text":
 			scanTextLines(stdout, "stdout", ch)
 		default:
@@ -141,7 +142,7 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 				At: time.Now(),
 			}
 		}
-		ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+		emitDoneIfNeeded(ch, &doneEmitted)
 	}()
 
 	return agentio.NewChannelStream(ch, closeStream), nil
@@ -238,7 +239,7 @@ func scanTextLines(r io.Reader, streamName string, ch chan<- agentio.Event) {
 	}
 }
 
-func parseJSONL(r io.Reader, ch chan<- agentio.Event) {
+func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
 
@@ -250,63 +251,77 @@ func parseJSONL(r io.Reader, ch chan<- agentio.Event) {
 
 		events, err := decodeFramedPayload([]byte(line))
 		if err != nil {
-			ch <- agentio.Event{
+			emitEvent(ch, doneEmitted, agentio.Event{
 				Type: agentio.EventFailure,
 				Err: &agentio.EventError{
 					Code:    "jsonl_decode_error",
 					Message: err.Error(),
 				},
 				At: time.Now(),
-			}
+			})
 			continue
 		}
 		for _, event := range events {
-			ch <- event
+			emitEvent(ch, doneEmitted, event)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "jsonl_scan_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 	}
 }
 
-func parseSingleJSON(r io.Reader, ch chan<- agentio.Event) {
+func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	body, err := io.ReadAll(r)
 	if err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_read_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 		return
 	}
 
 	events, err := decodeFramedPayload(body)
 	if err != nil {
-		ch <- agentio.Event{
+		emitEvent(ch, doneEmitted, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_decode_error",
 				Message: err.Error(),
 			},
 			At: time.Now(),
-		}
+		})
 		return
 	}
 
 	for _, event := range events {
-		ch <- event
+		emitEvent(ch, doneEmitted, event)
 	}
+}
+
+func emitDoneIfNeeded(ch chan<- agentio.Event, doneEmitted *bool) {
+	if doneEmitted != nil && *doneEmitted {
+		return
+	}
+	emitEvent(ch, doneEmitted, agentio.Event{Type: agentio.EventDone, At: time.Now()})
+}
+
+func emitEvent(ch chan<- agentio.Event, doneEmitted *bool, event agentio.Event) {
+	if doneEmitted != nil && event.Type == agentio.EventDone {
+		*doneEmitted = true
+	}
+	ch <- event
 }
 
 func decodeFramedPayload(payload []byte) ([]agentio.Event, error) {

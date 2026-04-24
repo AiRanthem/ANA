@@ -58,3 +58,48 @@ func TestDefaultHTTPResponseDecoder_UsesSSEStreamForEventStreamResponses(t *test
 		t.Fatalf("stream.Recv() terminal error = %v, want %v", err, agentio.ErrStreamClosed)
 	}
 }
+
+func TestDefaultHTTPResponseDecoder_EmitsDoneOnlyOnceForSSEDoneFrame(t *testing.T) {
+	resp := &http.Response{
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+		},
+		Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+	}
+
+	stream, err := DefaultHTTPResponseDecoder(resp)
+	if err != nil {
+		t.Fatalf("DefaultHTTPResponseDecoder() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			t.Fatalf("stream.Close() error = %v", closeErr)
+		}
+	})
+
+	events := collectEvents(t, stream)
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	if events[0].Type != agentio.EventDone {
+		t.Fatalf("events[0].Type = %q, want %q", events[0].Type, agentio.EventDone)
+	}
+}
+
+func collectEvents(t *testing.T, stream agentio.EventStream) []agentio.Event {
+	t.Helper()
+
+	ctx := context.Background()
+	var events []agentio.Event
+
+	for {
+		event, err := stream.Recv(ctx)
+		if errors.Is(err, agentio.ErrStreamClosed) {
+			return events
+		}
+		if err != nil {
+			t.Fatalf("stream.Recv() error = %v", err)
+		}
+		events = append(events, *event)
+	}
+}
