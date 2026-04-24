@@ -80,7 +80,17 @@ type TextReaderAdapter struct {
 }
 
 func NewTextReaderAdapter(stream EventStream) io.ReadCloser {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewTextReaderAdapterWithContext(context.Background(), stream)
+}
+
+// NewTextReaderAdapterWithContext converts a structured EventStream into an
+// io.ReadCloser that also stops blocked reads when the parent context is
+// canceled.
+func NewTextReaderAdapterWithContext(ctx context.Context, stream EventStream) io.ReadCloser {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &TextReaderAdapter{
 		stream: stream,
 		ctx:    ctx,

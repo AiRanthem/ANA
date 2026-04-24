@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime"
 	"strings"
+	"time"
 )
 
 // CanonicalPart is a JSON-safe representation used by the default encoders.
@@ -30,7 +31,16 @@ type CanonicalRequest struct {
 	Role      Role              `json:"role,omitempty"`
 	Input     []CanonicalPart   `json:"input"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
-	Options   InvokeOptions     `json:"options,omitempty"`
+	Options   canonicalOptions  `json:"options,omitempty"`
+}
+
+type canonicalOptions struct {
+	Model          string         `json:"model,omitempty"`
+	Stream         bool           `json:"stream,omitempty"`
+	TimeoutMS      int64          `json:"timeout_ms,omitempty"`
+	MaxOutputBytes int64          `json:"max_output_bytes,omitempty"`
+	Temperature    *float64       `json:"temperature,omitempty"`
+	Extra          map[string]any `json:"extra,omitempty"`
 }
 
 // CanonicalizeParts converts parts into a transport-neutral JSON-safe form.
@@ -174,7 +184,7 @@ func ToCanonicalRequest(req *InvokeRequest) (*CanonicalRequest, error) {
 		Role:      req.Role,
 		Input:     input,
 		Metadata:  req.Metadata,
-		Options:   req.Options,
+		Options:   canonicalizeOptions(req.Options),
 	}, nil
 }
 
@@ -193,4 +203,22 @@ func extension(filename string) string {
 		return filename[idx:]
 	}
 	return ""
+}
+
+func canonicalizeOptions(options InvokeOptions) canonicalOptions {
+	canonical := canonicalOptions{
+		Model:          options.Model,
+		Stream:         options.Stream,
+		MaxOutputBytes: options.MaxOutputBytes,
+		Temperature:    options.Temperature,
+		Extra:          options.Extra,
+	}
+	if options.Timeout > 0 {
+		canonical.TimeoutMS = durationMilliseconds(options.Timeout)
+	}
+	return canonical
+}
+
+func durationMilliseconds(d time.Duration) int64 {
+	return int64(d / time.Millisecond)
 }

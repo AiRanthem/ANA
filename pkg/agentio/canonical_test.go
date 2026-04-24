@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestEncodeCanonicalRequestJSON_EncodesTypedInputParts(t *testing.T) {
@@ -162,6 +163,40 @@ func TestEncodeCanonicalRequestJSON_EncodesPointerInputParts(t *testing.T) {
 		"call_id": "call-ptr",
 	}) {
 		t.Fatalf("tool result metadata = %#v, want pointer call_id", metadata)
+	}
+}
+
+func TestEncodeCanonicalRequestJSON_EncodesTimeoutAsMilliseconds(t *testing.T) {
+	req := &InvokeRequest{
+		RequestID: "req-timeout",
+		Parts: []InputPart{
+			TextPart{Text: "hello"},
+		},
+		Options: InvokeOptions{
+			Model:   "gpt-test",
+			Timeout: 1500 * time.Millisecond,
+		},
+	}
+
+	raw, err := EncodeCanonicalRequestJSON(req)
+	if err != nil {
+		t.Fatalf("EncodeCanonicalRequestJSON() error = %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	options := mustObject(t, got["options"], "options")
+	if options["model"] != "gpt-test" {
+		t.Fatalf("options.model = %v, want gpt-test", options["model"])
+	}
+	if options["timeout_ms"] != float64(1500) {
+		t.Fatalf("options.timeout_ms = %v, want 1500", options["timeout_ms"])
+	}
+	if _, ok := options["timeout"]; ok {
+		t.Fatalf("options.timeout present = true, want false")
 	}
 }
 

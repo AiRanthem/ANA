@@ -142,6 +142,32 @@ func TestTextReaderAdapter_CloseUnblocksPendingRead(t *testing.T) {
 	}
 }
 
+func TestTextReaderAdapter_ParentContextCancellationUnblocksPendingRead(t *testing.T) {
+	stream := newBlockingEventStream()
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := NewTextReaderAdapterWithContext(ctx, stream)
+	defer reader.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8)
+		_, err := reader.Read(buf)
+		errCh <- err
+	}()
+
+	stream.waitForRecv(t)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Read() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read() remained blocked after parent context cancellation")
+	}
+}
+
 type blockingEventStream struct {
 	recvStarted chan struct{}
 	closeOnce   sync.Once
