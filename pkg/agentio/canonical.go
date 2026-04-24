@@ -46,7 +46,30 @@ func CanonicalizeParts(parts []InputPart) ([]CanonicalPart, error) {
 				Type: "text",
 				Text: p.Text,
 			})
+		case *TextPart:
+			if p == nil {
+				return nil, fmt.Errorf("parts[%d]: text part is nil", i)
+			}
+			if err := p.Validate(); err != nil {
+				return nil, fmt.Errorf("parts[%d]: %w", i, err)
+			}
+			out = append(out, CanonicalPart{
+				Type: "text",
+				Text: p.Text,
+			})
 		case JSONPart:
+			if err := p.Validate(); err != nil {
+				return nil, fmt.Errorf("parts[%d]: %w", i, err)
+			}
+			out = append(out, CanonicalPart{
+				Type: "json",
+				Name: p.Name,
+				Data: p.Data,
+			})
+		case *JSONPart:
+			if p == nil {
+				return nil, fmt.Errorf("parts[%d]: json part is nil", i)
+			}
 			if err := p.Validate(); err != nil {
 				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
@@ -59,34 +82,31 @@ func CanonicalizeParts(parts []InputPart) ([]CanonicalPart, error) {
 			if err := p.Validate(); err != nil {
 				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
-			source := map[string]any{
-				"type": string(p.SourceType),
+			out = append(out, canonicalBlobPart(p))
+		case *BlobPart:
+			if p == nil {
+				return nil, fmt.Errorf("parts[%d]: blob part is nil", i)
 			}
-			switch p.SourceType {
-			case BlobInline:
-				source["data_base64"] = base64.StdEncoding.EncodeToString(p.Data)
-			case BlobFile:
-				source["path"] = p.Path
-			case BlobURL:
-				source["url"] = p.URL
+			if err := p.Validate(); err != nil {
+				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
-			if p.Size > 0 {
-				source["size"] = p.Size
-			}
-			if p.MIMEType == "" && p.Filename != "" {
-				if mt := mime.TypeByExtension(extension(p.Filename)); mt != "" {
-					p.MIMEType = mt
-				}
+			out = append(out, canonicalBlobPart(*p))
+		case ToolResultPart:
+			if err := p.Validate(); err != nil {
+				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
 			out = append(out, CanonicalPart{
-				Type:     p.Kind,
-				Kind:     p.Kind,
-				MIMEType: p.MIMEType,
-				Filename: p.Filename,
-				Source:   source,
-				Metadata: p.Metadata,
+				Type: "tool_result",
+				Name: p.ToolName,
+				Data: p.Data,
+				Metadata: map[string]string{
+					"call_id": p.CallID,
+				},
 			})
-		case ToolResultPart:
+		case *ToolResultPart:
+			if p == nil {
+				return nil, fmt.Errorf("parts[%d]: tool result part is nil", i)
+			}
 			if err := p.Validate(); err != nil {
 				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
@@ -103,6 +123,36 @@ func CanonicalizeParts(parts []InputPart) ([]CanonicalPart, error) {
 		}
 	}
 	return out, nil
+}
+
+func canonicalBlobPart(p BlobPart) CanonicalPart {
+	source := map[string]any{
+		"type": string(p.SourceType),
+	}
+	switch p.SourceType {
+	case BlobInline:
+		source["data_base64"] = base64.StdEncoding.EncodeToString(p.Data)
+	case BlobFile:
+		source["path"] = p.Path
+	case BlobURL:
+		source["url"] = p.URL
+	}
+	if p.Size > 0 {
+		source["size"] = p.Size
+	}
+	if p.MIMEType == "" && p.Filename != "" {
+		if mt := mime.TypeByExtension(extension(p.Filename)); mt != "" {
+			p.MIMEType = mt
+		}
+	}
+	return CanonicalPart{
+		Type:     p.Kind,
+		Kind:     p.Kind,
+		MIMEType: p.MIMEType,
+		Filename: p.Filename,
+		Source:   source,
+		Metadata: p.Metadata,
+	}
 }
 
 // ToCanonicalRequest converts InvokeRequest into the default canonical JSON

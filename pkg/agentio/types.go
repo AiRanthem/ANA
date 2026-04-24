@@ -179,28 +179,56 @@ func (r *InvokeRequest) Validate() error {
 		return errors.New("request has no input parts")
 	}
 	for i, part := range r.Parts {
-		switch p := part.(type) {
-		case TextPart:
-			if err := p.Validate(); err != nil {
-				return fmt.Errorf("parts[%d]: %w", i, err)
+		if err := validateInputPart(part); err != nil {
+			var unsupportedPartTypeErr *unsupportedPartTypeError
+			if errors.As(err, &unsupportedPartTypeErr) {
+				return fmt.Errorf("parts[%d]: unsupported part type %T", i, part)
 			}
-		case JSONPart:
-			if err := p.Validate(); err != nil {
-				return fmt.Errorf("parts[%d]: %w", i, err)
-			}
-		case BlobPart:
-			if err := p.Validate(); err != nil {
-				return fmt.Errorf("parts[%d]: %w", i, err)
-			}
-		case ToolResultPart:
-			if err := p.Validate(); err != nil {
-				return fmt.Errorf("parts[%d]: %w", i, err)
-			}
-		default:
-			return fmt.Errorf("parts[%d]: unsupported part type %T", i, part)
+			return fmt.Errorf("parts[%d]: %w", i, err)
 		}
 	}
 	return nil
+}
+
+type unsupportedPartTypeError struct{}
+
+func (e *unsupportedPartTypeError) Error() string {
+	return "unsupported part type"
+}
+
+func validateInputPart(part InputPart) error {
+	switch p := part.(type) {
+	case TextPart:
+		return p.Validate()
+	case *TextPart:
+		if p == nil {
+			return errors.New("text part is nil")
+		}
+		return p.Validate()
+	case JSONPart:
+		return p.Validate()
+	case *JSONPart:
+		if p == nil {
+			return errors.New("json part is nil")
+		}
+		return p.Validate()
+	case BlobPart:
+		return p.Validate()
+	case *BlobPart:
+		if p == nil {
+			return errors.New("blob part is nil")
+		}
+		return p.Validate()
+	case ToolResultPart:
+		return p.Validate()
+	case *ToolResultPart:
+		if p == nil {
+			return errors.New("tool result part is nil")
+		}
+		return p.Validate()
+	default:
+		return &unsupportedPartTypeError{}
+	}
 }
 
 // Usage is a canonical token/cost accounting payload.

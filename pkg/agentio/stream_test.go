@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -111,5 +112,80 @@ func TestTextReaderAdapter_ReturnsEOFWhenStreamAlreadyClosed(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("Read() n = %d, want 0", n)
+	}
+}
+
+func TestTextReaderAdapter_CloseUnblocksPendingRead(t *testing.T) {
+	stream := newBlockingEventStream()
+	reader := NewTextReaderAdapter(stream)
+
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8)
+		_, err := reader.Read(buf)
+		errCh <- err
+	}()
+
+	stream.waitForRecv(t)
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Read() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read() remained blocked after Close()")
+	}
+}
+
+type blockingEventStream struct {
+	recvStarted chan struct{}
+	closeOnce   sync.Once
+	closeCh     chan struct{}
+}
+
+func newBlockingEventStream() *blockingEventStream {
+	return &blockingEventStream{
+		recvStarted: make(chan struct{}),
+		closeCh:     make(chan struct{}),
+	}
+}
+
+func (s *blockingEventStream) Recv(ctx context.Context) (*Event, error) {
+	s.closeOnce.Do(func() {
+		close(s.recvStarted)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.closeCh:
+		return nil, ErrStreamClosed
+	}
+}
+
+func (s *blockingEventStream) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.recvStarted)
+	})
+	select {
+	case <-s.closeCh:
+	default:
+		close(s.closeCh)
+	}
+	return nil
+}
+
+func (s *blockingEventStream) waitForRecv(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-s.recvStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recv() was not called")
 	}
 }

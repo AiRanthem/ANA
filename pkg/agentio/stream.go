@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 )
 
 // ChannelStream is a channel-backed EventStream.
@@ -70,19 +71,28 @@ func CollectText(ctx context.Context, stream EventStream) (string, error) {
 // abstraction remains EventStream.
 type TextReaderAdapter struct {
 	stream EventStream
+	ctx    context.Context
+	cancel context.CancelFunc
 	buf    bytes.Buffer
+	mu     sync.Mutex
+	once   sync.Once
 	closed bool
 }
 
 func NewTextReaderAdapter(stream EventStream) io.ReadCloser {
-	return &TextReaderAdapter{stream: stream}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &TextReaderAdapter{
+		stream: stream,
+		ctx:    ctx,
+		cancel: cancel,
+	}
 }
 
 func (r *TextReaderAdapter) Read(p []byte) (int, error) {
-	for r.buf.Len() == 0 && !r.closed {
-		ev, err := r.stream.Recv(context.Background())
+	for r.bufLen() == 0 && !r.isClosed() {
+		ev, err := r.stream.Recv(r.ctx)
 		if errors.Is(err, ErrStreamClosed) {
-			r.closed = true
+			r.markClosed()
 			break
 		}
 		if err != nil {
@@ -90,23 +100,50 @@ func (r *TextReaderAdapter) Read(p []byte) (int, error) {
 		}
 		switch ev.Type {
 		case EventTextDelta, EventMessage, EventStatus:
+			r.mu.Lock()
 			r.buf.WriteString(ev.Text)
+			r.mu.Unlock()
 		case EventFailure:
 			if ev.Err != nil {
 				return 0, errors.New(ev.Err.Message)
 			}
 			return 0, errors.New("event error without payload")
 		case EventDone:
-			r.closed = true
+			r.markClosed()
 		}
 	}
-	if r.buf.Len() == 0 && r.closed {
+	if r.bufLen() == 0 && r.isClosed() {
 		return 0, io.EOF
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.buf.Read(p)
 }
 
 func (r *TextReaderAdapter) Close() error {
+	var err error
+	r.once.Do(func() {
+		r.markClosed()
+		r.cancel()
+		err = r.stream.Close()
+	})
+	return err
+}
+
+func (r *TextReaderAdapter) bufLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Len()
+}
+
+func (r *TextReaderAdapter) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
+func (r *TextReaderAdapter) markClosed() {
+	r.mu.Lock()
 	r.closed = true
-	return r.stream.Close()
+	r.mu.Unlock()
 }
