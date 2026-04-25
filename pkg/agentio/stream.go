@@ -1,0 +1,159 @@
+package agentio
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"sync"
+)
+
+// ChannelStream is a channel-backed EventStream.
+type ChannelStream struct {
+	ch      <-chan Event
+	closeFn func() error
+}
+
+func (s *ChannelStream) Recv(ctx context.Context) (*Event, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case ev, ok := <-s.ch:
+		if !ok {
+			return nil, ErrStreamClosed
+		}
+		return &ev, nil
+	}
+}
+
+func (s *ChannelStream) Close() error {
+	if s.closeFn != nil {
+		return s.closeFn()
+	}
+	return nil
+}
+
+// NewChannelStream creates an EventStream from a receive-only channel.
+func NewChannelStream(ch <-chan Event, closeFn func() error) EventStream {
+	return &ChannelStream{ch: ch, closeFn: closeFn}
+}
+
+// CollectText consumes text-bearing events into a single string.
+func CollectText(ctx context.Context, stream EventStream) (string, error) {
+	var b strings.Builder
+	defer stream.Close()
+
+	for {
+		ev, err := stream.Recv(ctx)
+		if errors.Is(err, ErrStreamClosed) {
+			return b.String(), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		switch ev.Type {
+		case EventTextDelta, EventMessage, EventStatus:
+			if ev.Text != "" {
+				b.WriteString(ev.Text)
+			}
+		case EventFailure:
+			if ev.Err != nil {
+				return "", errors.New(ev.Err.Message)
+			}
+			return "", errors.New("stream returned error event without payload")
+		}
+	}
+}
+
+// TextReaderAdapter converts a structured EventStream into an io.ReadCloser by
+// concatenating text-bearing events. It is a compatibility layer; the canonical
+// abstraction remains EventStream.
+type TextReaderAdapter struct {
+	stream EventStream
+	ctx    context.Context
+	cancel context.CancelFunc
+	buf    bytes.Buffer
+	mu     sync.Mutex
+	once   sync.Once
+	closed bool
+}
+
+func NewTextReaderAdapter(stream EventStream) io.ReadCloser {
+	return NewTextReaderAdapterWithContext(context.Background(), stream)
+}
+
+// NewTextReaderAdapterWithContext converts a structured EventStream into an
+// io.ReadCloser that also stops blocked reads when the parent context is
+// canceled.
+func NewTextReaderAdapterWithContext(ctx context.Context, stream EventStream) io.ReadCloser {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	return &TextReaderAdapter{
+		stream: stream,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+}
+
+func (r *TextReaderAdapter) Read(p []byte) (int, error) {
+	for r.bufLen() == 0 && !r.isClosed() {
+		ev, err := r.stream.Recv(r.ctx)
+		if errors.Is(err, ErrStreamClosed) {
+			r.markClosed()
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		switch ev.Type {
+		case EventTextDelta, EventMessage, EventStatus:
+			r.mu.Lock()
+			r.buf.WriteString(ev.Text)
+			r.mu.Unlock()
+		case EventFailure:
+			if ev.Err != nil {
+				return 0, errors.New(ev.Err.Message)
+			}
+			return 0, errors.New("event error without payload")
+		case EventDone:
+			r.markClosed()
+		}
+	}
+	if r.bufLen() == 0 && r.isClosed() {
+		return 0, io.EOF
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Read(p)
+}
+
+func (r *TextReaderAdapter) Close() error {
+	var err error
+	r.once.Do(func() {
+		r.markClosed()
+		r.cancel()
+		err = r.stream.Close()
+	})
+	return err
+}
+
+func (r *TextReaderAdapter) bufLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Len()
+}
+
+func (r *TextReaderAdapter) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
+func (r *TextReaderAdapter) markClosed() {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+}
