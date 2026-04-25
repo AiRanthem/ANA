@@ -84,11 +84,13 @@ func (a *Agent) OpenSession(ctx context.Context, req *agentio.InvokeRequest) (ag
 	}
 
 	session := &socketSession{
-		id:     req.SessionID,
-		conn:   conn,
-		encode: encode,
-		decode: decode,
-		ch:     make(chan agentio.Event, 128),
+		id:       req.SessionID,
+		conn:     conn,
+		encode:   encode,
+		decode:   decode,
+		ch:       make(chan agentio.Event, 128),
+		closed:   make(chan struct{}),
+		readDone: make(chan struct{}),
 	}
 	go session.readLoop(ctx)
 
@@ -115,7 +117,10 @@ type socketSession struct {
 	encode func([]agentio.InputPart) ([]byte, error)
 	decode func([]byte) ([]agentio.Event, error)
 
-	ch        chan agentio.Event
+	ch       chan agentio.Event
+	closed   chan struct{}
+	readDone chan struct{}
+
 	closeOnce sync.Once
 }
 
@@ -133,6 +138,8 @@ func (s *socketSession) Recv(ctx context.Context) (*agentio.Event, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-s.closed:
+		return nil, agentio.ErrStreamClosed
 	case event, ok := <-s.ch:
 		if !ok {
 			return nil, agentio.ErrStreamClosed
@@ -144,32 +151,41 @@ func (s *socketSession) Recv(ctx context.Context) (*agentio.Event, error) {
 func (s *socketSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		close(s.closed)
 		err = s.conn.Close()
-		close(s.ch)
 	})
 	return err
 }
 
 func (s *socketSession) readLoop(ctx context.Context) {
 	defer func() {
+		close(s.readDone)
 		_ = s.conn.Close()
-		s.closeOnce.Do(func() { close(s.ch) })
+		s.closeOnce.Do(func() { close(s.closed) })
+		close(s.ch)
 	}()
 
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.closed:
+			return
+		default:
+		}
+
 		payload, err := s.conn.Read(ctx)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
-				select {
-				case s.ch <- agentio.Event{
+				if !s.sendEvent(ctx, agentio.Event{
 					Type: agentio.EventFailure,
 					Err: &agentio.EventError{
 						Code:    "socket_read_error",
 						Message: err.Error(),
 					},
 					At: time.Now(),
-				}:
-				default:
+				}) {
+					return
 				}
 			}
 			return
@@ -177,27 +193,35 @@ func (s *socketSession) readLoop(ctx context.Context) {
 
 		events, err := s.decode(payload)
 		if err != nil {
-			select {
-			case s.ch <- agentio.Event{
+			if !s.sendEvent(ctx, agentio.Event{
 				Type: agentio.EventFailure,
 				Err: &agentio.EventError{
 					Code:    "socket_decode_error",
 					Message: err.Error(),
 				},
 				At: time.Now(),
-			}:
-			default:
+			}) {
+				return
 			}
 			return
 		}
 
 		for _, event := range events {
-			select {
-			case <-ctx.Done():
+			if !s.sendEvent(ctx, event) {
 				return
-			case s.ch <- event:
 			}
 		}
+	}
+}
+
+func (s *socketSession) sendEvent(ctx context.Context, event agentio.Event) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.closed:
+		return false
+	case s.ch <- event:
+		return true
 	}
 }
 

@@ -93,6 +93,8 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 
 	ch := make(chan agentio.Event, 128)
 	var once sync.Once
+	var producers sync.WaitGroup
+	stderrDone := make(chan struct{})
 	closeStream := func() error {
 		once.Do(func() {
 			_ = stdin.Close()
@@ -108,17 +110,23 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 		_, _ = stdin.Write(input)
 	}()
 
-	go scanTextLines(stderr, "stderr", ch)
-
+	producers.Add(1)
 	go func() {
-		defer close(ch)
+		defer producers.Done()
+		defer close(stderrDone)
+		scanTextLines(stderr, "stderr", ch)
+	}()
 
-		doneEmitted := false
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
+
+		doneSeen := false
 		switch strings.ToLower(a.StdoutFormat) {
 		case "", "stream-json":
-			parseJSONL(stdout, ch, &doneEmitted)
+			parseJSONL(stdout, ch, &doneSeen)
 		case "json":
-			parseSingleJSON(stdout, ch, &doneEmitted)
+			parseSingleJSON(stdout, ch, &doneSeen)
 		case "text":
 			scanTextLines(stdout, "stdout", ch)
 		default:
@@ -132,6 +140,7 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 			}
 		}
 
+		<-stderrDone
 		if err := cmd.Wait(); err != nil {
 			ch <- agentio.Event{
 				Type: agentio.EventFailure,
@@ -142,7 +151,12 @@ func (a *Agent) Invoke(ctx context.Context, req *agentio.InvokeRequest) (agentio
 				At: time.Now(),
 			}
 		}
-		emitDoneIfNeeded(ch, &doneEmitted)
+		emitDoneIfNeeded(ch, &doneSeen)
+	}()
+
+	go func() {
+		producers.Wait()
+		close(ch)
 	}()
 
 	return agentio.NewChannelStream(ch, closeStream), nil
@@ -239,7 +253,7 @@ func scanTextLines(r io.Reader, streamName string, ch chan<- agentio.Event) {
 	}
 }
 
-func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
+func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneSeen *bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 4<<20)
 
@@ -251,7 +265,7 @@ func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 
 		events, err := decodeFramedPayload([]byte(line))
 		if err != nil {
-			emitEvent(ch, doneEmitted, agentio.Event{
+			emitEvent(ch, doneSeen, agentio.Event{
 				Type: agentio.EventFailure,
 				Err: &agentio.EventError{
 					Code:    "jsonl_decode_error",
@@ -262,12 +276,12 @@ func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 			continue
 		}
 		for _, event := range events {
-			emitEvent(ch, doneEmitted, event)
+			emitEvent(ch, doneSeen, event)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		emitEvent(ch, doneEmitted, agentio.Event{
+		emitEvent(ch, doneSeen, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "jsonl_scan_error",
@@ -278,10 +292,10 @@ func parseJSONL(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	}
 }
 
-func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
+func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneSeen *bool) {
 	body, err := io.ReadAll(r)
 	if err != nil {
-		emitEvent(ch, doneEmitted, agentio.Event{
+		emitEvent(ch, doneSeen, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_read_error",
@@ -294,7 +308,7 @@ func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 
 	events, err := decodeFramedPayload(body)
 	if err != nil {
-		emitEvent(ch, doneEmitted, agentio.Event{
+		emitEvent(ch, doneSeen, agentio.Event{
 			Type: agentio.EventFailure,
 			Err: &agentio.EventError{
 				Code:    "json_decode_error",
@@ -306,20 +320,23 @@ func parseSingleJSON(r io.Reader, ch chan<- agentio.Event, doneEmitted *bool) {
 	}
 
 	for _, event := range events {
-		emitEvent(ch, doneEmitted, event)
+		emitEvent(ch, doneSeen, event)
 	}
 }
 
-func emitDoneIfNeeded(ch chan<- agentio.Event, doneEmitted *bool) {
-	if doneEmitted != nil && *doneEmitted {
+func emitDoneIfNeeded(ch chan<- agentio.Event, doneSeen *bool) {
+	if doneSeen != nil {
+		*doneSeen = true
+	}
+	ch <- agentio.Event{Type: agentio.EventDone, At: time.Now()}
+}
+
+func emitEvent(ch chan<- agentio.Event, doneSeen *bool, event agentio.Event) {
+	if event.Type == agentio.EventDone {
+		if doneSeen != nil {
+			*doneSeen = true
+		}
 		return
-	}
-	emitEvent(ch, doneEmitted, agentio.Event{Type: agentio.EventDone, At: time.Now()})
-}
-
-func emitEvent(ch chan<- agentio.Event, doneEmitted *bool, event agentio.Event) {
-	if doneEmitted != nil && event.Type == agentio.EventDone {
-		*doneEmitted = true
 	}
 	ch <- event
 }
