@@ -610,6 +610,33 @@ calls and trust that the adapter handles continuity.
 The orchestrator implementation can mock these contracts during early tests
 but the integration tests against real bridges block on (1)–(3) shipping.
 
+### 7.5 Bridge transport invariants (correctness guarantees)
+
+These are behavioral requirements on `pkg/bridge/...` implementations so the
+orchestrator and ingress layers can rely on deterministic teardown and
+subprocess hygiene. They complement the structural extensions in §7.2–§7.3.
+
+**Socket (`pkg/bridge/socket`) — drain before terminal close**
+
+- Implementations of `agentio.Session` backed by a socket read loop MUST NOT
+  let `Recv` return a terminal stream-closed error while events are still
+  queued in the session's delivery channel.
+- Concretely: when the read side finishes and signals shutdown, `Recv` must
+  prefer delivering buffered events (including final `error` / `done`-style
+  frames) over reporting `ErrStreamClosed` (or equivalent), so a `select`
+  that races `closed` against the event channel does not drop terminal
+  diagnostics nondeterministically.
+
+**CLI (`pkg/bridge/cli`) — environment inheritance**
+
+- When `cli.Agent` (or equivalent) accepts caller-supplied `Env` entries, the
+  child process environment MUST be formed by merging those entries onto the
+  parent’s inherited environment (for example `os.Environ()`), with
+  caller-supplied keys overriding duplicates.
+- Building `cmd.Env` from an empty base when overrides are present is
+  forbidden: it strips `PATH`, `HOME`, TLS trust roots, and other inherited
+  variables and breaks typical CLI tools and nested subprocesses.
+
 ## 8. Event Taxonomy
 
 Two channels share an event-type namespace. All events are emitted by the
