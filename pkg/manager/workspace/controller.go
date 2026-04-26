@@ -62,6 +62,9 @@ type Controller struct {
 	workersDone      chan struct{}
 	workersRemaining atomic.Int64
 	inflight         atomic.Int64
+
+	installCancel  map[WorkspaceID]context.CancelFunc
+	installRunning map[WorkspaceID]int
 }
 
 type installJob struct {
@@ -109,6 +112,8 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 		installWorkers: cfg.InstallWorkers,
 		maxPluginSize:  cfg.MaxPluginSize,
 		probeTimeout:   cfg.ProbeTimeout,
+		installCancel:  make(map[WorkspaceID]context.CancelFunc),
+		installRunning: make(map[WorkspaceID]int),
 	}
 	c.queueCond = sync.NewCond(&c.mu)
 	return c, nil
@@ -213,12 +218,22 @@ func (c *Controller) Submit(ctx context.Context, w Workspace, params agent.Insta
 }
 
 // Delete tears a workspace down synchronously and always attempts repository deletion.
+// It drops any queued install jobs for the workspace, cancels an in-flight install for
+// that id, then waits until no worker is still running that install before opening infra.
 func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 	c.mu.Lock()
 	stopped := c.stopped
 	c.mu.Unlock()
 	if stopped {
 		return ErrControllerShutdown
+	}
+
+	cancelFn := c.takeAndCancelQueuedInstalls(id)
+	if cancelFn != nil {
+		cancelFn()
+	}
+	if err := c.waitInstallIdle(ctx, id); err != nil {
+		return fmt.Errorf("workspace delete wait install %q: %w", id, err)
 	}
 
 	row, err := c.repo.Get(ctx, id)
@@ -291,18 +306,68 @@ func (c *Controller) worker() {
 	}()
 
 	for {
-		job, ok := c.dequeue()
+		job, jobCtx, jobCancel, ok := c.dequeue()
 		if !ok {
 			return
 		}
-
-		c.inflight.Add(1)
-		c.runInstall(job)
-		c.inflight.Add(-1)
+		c.runOneInstall(job, jobCtx, jobCancel)
 	}
 }
 
-func (c *Controller) dequeue() (installJob, bool) {
+func (c *Controller) runOneInstall(job installJob, jobCtx context.Context, jobCancel context.CancelFunc) {
+	c.inflight.Add(1)
+	defer c.inflight.Add(-1)
+	defer func() {
+		jobCancel()
+		c.finishTrackedInstall(job.workspace.ID)
+	}()
+
+	c.runInstall(job, jobCtx)
+}
+
+// takeAndCancelQueuedInstalls removes queued install jobs for id and returns the
+// cancel function for an in-flight install, if any (caller should invoke it
+// outside the lock). The returned function may be nil.
+func (c *Controller) takeAndCancelQueuedInstalls(id WorkspaceID) context.CancelFunc {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	newQ := c.queue[:0]
+	for _, j := range c.queue {
+		if j.workspace.ID != id {
+			newQ = append(newQ, j)
+		}
+	}
+	c.queue = newQ
+	fn := c.installCancel[id]
+	c.queueCond.Broadcast()
+	return fn
+}
+
+func (c *Controller) waitInstallIdle(ctx context.Context, id WorkspaceID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.installRunning[id] > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.queueCond.Wait()
+	}
+	return nil
+}
+
+func (c *Controller) finishTrackedInstall(id WorkspaceID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.installRunning[id]--
+	if c.installRunning[id] <= 0 {
+		delete(c.installRunning, id)
+		delete(c.installCancel, id)
+	}
+	c.queueCond.Broadcast()
+}
+
+func (c *Controller) dequeue() (installJob, context.Context, context.CancelFunc, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -311,24 +376,32 @@ func (c *Controller) dequeue() (installJob, bool) {
 	}
 
 	if len(c.queue) == 0 && c.stopped {
-		return installJob{}, false
+		return installJob{}, nil, nil, false
 	}
 
 	job := c.queue[0]
 	c.queue[0] = installJob{}
 	c.queue = c.queue[1:]
-	return job, true
+
+	jobCtx, jobCancel := context.WithCancel(c.installCtx)
+	if prev := c.installCancel[job.workspace.ID]; prev != nil {
+		prev()
+	}
+	c.installCancel[job.workspace.ID] = jobCancel
+	c.installRunning[job.workspace.ID]++
+
+	return job, jobCtx, jobCancel, true
 }
 
-func (c *Controller) runInstall(job installJob) {
+func (c *Controller) runInstall(job installJob, parent context.Context) {
 	persistCtx := context.Background()
 
-	if err := c.installCtx.Err(); err != nil {
-		c.transitionToFailed(persistCtx, c.installCtx, job.workspace.ID, failureForShutdown(c.clock()), time.Time{})
+	if err := parent.Err(); err != nil {
+		c.transitionToFailed(persistCtx, parent, job.workspace.ID, failureForShutdown(c.clock()), time.Time{})
 		return
 	}
 
-	installCtx, cancel := context.WithTimeout(c.installCtx, c.installTimeout)
+	installCtx, cancel := context.WithTimeout(parent, c.installTimeout)
 	defer cancel()
 
 	factory, ok := c.factories.Get(infraops.InfraType(job.workspace.InfraType))

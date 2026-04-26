@@ -193,6 +193,62 @@ func TestControllerDeleteContinuesPastUninstallAndClearErrors(t *testing.T) {
 	}
 }
 
+func TestControllerDeleteWaitsForInFlightInstall(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_del_wait", "del-wait", StatusInit)
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("install did not start")
+	}
+
+	delDone := make(chan error, 1)
+	go func() {
+		delDone <- h.controller.Delete(context.Background(), row.ID)
+	}()
+
+	select {
+	case err := <-delDone:
+		t.Fatalf("Delete() completed early with err=%v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-delDone:
+		if err != nil {
+			t.Fatalf("Delete() error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Delete() did not complete after install released")
+	}
+
+	if _, err := h.repo.Get(context.Background(), row.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("Get() after Delete error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
 func TestControllerStopCancelsInflightAndRejectsNewSubmit(t *testing.T) {
 	t.Parallel()
 
