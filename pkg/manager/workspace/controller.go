@@ -51,11 +51,11 @@ type Controller struct {
 	maxPluginSize  int64
 	probeTimeout   time.Duration
 
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	queueCond  *sync.Cond
 	queue      []installJob
-	started    bool
-	stopped    bool
+	started    atomic.Bool
+	stopped    atomic.Bool
 	installCtx context.Context
 	cancel     context.CancelFunc
 
@@ -130,10 +130,10 @@ func (c *Controller) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.stopped {
+	if c.stopped.Load() {
 		return ErrControllerShutdown
 	}
-	if c.started {
+	if c.started.Load() {
 		return nil
 	}
 
@@ -145,7 +145,7 @@ func (c *Controller) Start(ctx context.Context) error {
 	c.installCtx, c.cancel = context.WithCancel(root)
 	c.workersDone = make(chan struct{})
 	c.workersRemaining.Store(int64(c.installWorkers))
-	c.started = true
+	c.started.Store(true)
 
 	for i := 0; i < c.installWorkers; i++ {
 		go c.worker()
@@ -155,26 +155,17 @@ func (c *Controller) Start(ctx context.Context) error {
 
 // Stop cancels in-flight installs and waits for workers to exit.
 func (c *Controller) Stop(ctx context.Context) error {
-	c.mu.Lock()
-	if c.stopped {
-		started := c.started
-		workersDone := c.workersDone
-		c.mu.Unlock()
-		if !started {
-			return nil
-		}
-		if workersDone == nil {
-			return nil
-		}
-		select {
-		case <-workersDone:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if c.stopped.Load() {
+		return c.waitWorkersShutdown(ctx)
 	}
-	c.stopped = true
-	started := c.started
+
+	c.mu.Lock()
+	if c.stopped.Load() {
+		c.mu.Unlock()
+		return c.waitWorkersShutdown(ctx)
+	}
+	c.stopped.Store(true)
+	started := c.started.Load()
 	cancel := c.cancel
 	workersDone := c.workersDone
 	c.queueCond.Broadcast()
@@ -196,6 +187,24 @@ func (c *Controller) Stop(ctx context.Context) error {
 	}
 }
 
+func (c *Controller) waitWorkersShutdown(ctx context.Context) error {
+	c.mu.RLock()
+	workersDone := c.workersDone
+	c.mu.RUnlock()
+	if !c.started.Load() {
+		return nil
+	}
+	if workersDone == nil {
+		return nil
+	}
+	select {
+	case <-workersDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Submit enqueues a workspace install job and returns immediately.
 func (c *Controller) Submit(ctx context.Context, w Workspace, params agent.InstallParams) error {
 	if err := ctx.Err(); err != nil {
@@ -205,7 +214,7 @@ func (c *Controller) Submit(ctx context.Context, w Workspace, params agent.Insta
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.started || c.stopped {
+	if !c.started.Load() || c.stopped.Load() {
 		return ErrControllerShutdown
 	}
 
@@ -221,10 +230,7 @@ func (c *Controller) Submit(ctx context.Context, w Workspace, params agent.Insta
 // It drops any queued install jobs for the workspace, cancels an in-flight install for
 // that id, then waits until no worker is still running that install before opening infra.
 func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
-	c.mu.Lock()
-	stopped := c.stopped
-	c.mu.Unlock()
-	if stopped {
+	if c.stopped.Load() {
 		return ErrControllerShutdown
 	}
 
@@ -371,11 +377,11 @@ func (c *Controller) dequeue() (installJob, context.Context, context.CancelFunc,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(c.queue) == 0 && !c.stopped {
+	for len(c.queue) == 0 && !c.stopped.Load() {
 		c.queueCond.Wait()
 	}
 
-	if len(c.queue) == 0 && c.stopped {
+	if len(c.queue) == 0 && c.stopped.Load() {
 		return installJob{}, nil, nil, false
 	}
 
