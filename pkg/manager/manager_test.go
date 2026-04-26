@@ -98,6 +98,155 @@ func TestManagerStop_SecondCallSucceedsIdempotently(t *testing.T) {
 	}
 }
 
+func TestManagerBuild_DoesNotStartWorkersBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	spec := &fakeAgentSpec{}
+	_ = newTestManager(t, testManagerOptions{
+		spec:          spec,
+		probeInterval: 10 * time.Millisecond,
+	})
+
+	time.Sleep(150 * time.Millisecond)
+	if got := spec.installCalls.Load(); got != 0 {
+		t.Fatalf("Install() calls after Build without Start = %d, want 0 (no background workers)", got)
+	}
+}
+
+func TestManagerStart_StartsWorkersAndScheduler(t *testing.T) {
+	t.Parallel()
+
+	spec := &fakeAgentSpec{}
+	managerInstance := newTestManager(t, testManagerOptions{
+		spec:          spec,
+		probeInterval: 10 * time.Millisecond,
+	})
+
+	pluginBody := buildPluginZip(t, "demo-plugin", "ws")
+	plug, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "demo-plugin",
+		Content: bytes.NewReader(pluginBody),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	if err := managerInstance.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	row, err := managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Alias:        Alias("StartProbe"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": t.TempDir()},
+		Plugins:      []PluginRef{{ID: plug.ID}},
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace() error = %v", err)
+	}
+	if row.Status != StatusInit {
+		t.Fatalf("initial Status = %q, want %q", row.Status, StatusInit)
+	}
+
+	_ = waitForWorkspaceStatus(t, managerInstance, row.ID, StatusHealthy, time.Second)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if spec.probeCalls.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if spec.probeCalls.Load() < 1 {
+		t.Fatalf("Probe() calls = %d, want scheduler running after Start()", spec.probeCalls.Load())
+	}
+}
+
+func TestManagerCreateWorkspace_SubmitFailureDeletesRowWithoutStatusWrite(t *testing.T) {
+	t.Parallel()
+
+	managerInstance := newTestManager(t, testManagerOptions{})
+	pluginBody := buildPluginZip(t, "demo-plugin", "body")
+	plug, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "demo-plugin",
+		Content: bytes.NewReader(pluginBody),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	// Controller is not running until Start; Submit fails and the row must be removed.
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Alias:        Alias("NoStart"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": t.TempDir()},
+		Plugins:      []PluginRef{{ID: plug.ID}},
+	})
+	if err == nil {
+		t.Fatal("CreateWorkspace() error = nil, want non-nil")
+	}
+	if !errors.Is(err, workspace.ErrControllerShutdown) {
+		t.Fatalf("CreateWorkspace() error = %v, want errors.Is(..., workspace.ErrControllerShutdown)", err)
+	}
+
+	_, err = managerInstance.GetWorkspace(context.Background(), WorkspaceID("wsp_fixed"))
+	if !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("GetWorkspace() error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+func TestManagerDeletePlugin_StorageDeleteFailureDoesNotDeleteRepository(t *testing.T) {
+	t.Parallel()
+
+	inner := plugin.NewMemoryStorage()
+	managerInstance := newTestManager(t, testManagerOptions{
+		pluginStorage: errOnPluginStorageDelete{MemoryStorage: inner},
+	})
+
+	body := buildPluginZip(t, "hold-repo", "blob")
+	created, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "hold-repo",
+		Content: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err == nil {
+		t.Fatal("DeletePlugin() error = nil, want non-nil")
+	}
+
+	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); err != nil {
+		t.Fatalf("GetPlugin() after failed DeletePlugin error = %v, want nil", err)
+	}
+}
+
+func TestManagerDeletePlugin_StorageNotFoundStillDeletesRepository(t *testing.T) {
+	t.Parallel()
+
+	managerInstance := newTestManager(t, testManagerOptions{
+		pluginStorage: notFoundPluginStorageDelete{MemoryStorage: plugin.NewMemoryStorage()},
+	})
+
+	body := buildPluginZip(t, "orphan-meta", "blob")
+	created, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "orphan-meta",
+		Content: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err != nil {
+		t.Fatalf("DeletePlugin() error = %v", err)
+	}
+
+	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); !errors.Is(err, ErrPluginNotFound) {
+		t.Fatalf("GetPlugin() error = %v, want ErrPluginNotFound", err)
+	}
+}
+
 func TestManagerCreatePluginUpsertsByNamespaceAndName(t *testing.T) {
 	t.Parallel()
 
@@ -435,6 +584,25 @@ type testManagerOptions struct {
 	spec          *fakeAgentSpec
 	probeInterval time.Duration
 	pluginRepo    plugin.Repository
+	pluginStorage plugin.Storage
+}
+
+// errOnPluginStorageDelete wraps MemoryStorage and forces Delete to fail.
+type errOnPluginStorageDelete struct {
+	*plugin.MemoryStorage
+}
+
+func (errOnPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
+	return errors.New("forced storage delete failure")
+}
+
+// notFoundPluginStorageDelete wraps MemoryStorage and makes Delete return ErrStorageNotFound.
+type notFoundPluginStorageDelete struct {
+	*plugin.MemoryStorage
+}
+
+func (notFoundPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
+	return plugin.ErrStorageNotFound
 }
 
 func newTestManager(t *testing.T, opts testManagerOptions) Manager {
@@ -453,7 +621,11 @@ func newTestManager(t *testing.T, opts testManagerOptions) Manager {
 	} else {
 		builder.PluginRepository = plugin.NewMemoryRepository()
 	}
-	builder.PluginStorage = plugin.NewMemoryStorage()
+	if opts.pluginStorage != nil {
+		builder.PluginStorage = opts.pluginStorage
+	} else {
+		builder.PluginStorage = plugin.NewMemoryStorage()
+	}
 	builder.WorkspaceRepository = workspace.NewMemoryRepository()
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_fixed"),

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -179,5 +180,24 @@ func TestMemoryStorage_AtomicOverwrite(t *testing.T) {
 	wg.Wait()
 	if readErr != nil {
 		t.Fatalf("atomic overwrite read error: %v", readErr)
+	}
+}
+
+func TestMemoryStorage_List_Sorted(t *testing.T) {
+	t.Parallel()
+	st := NewMemoryStorage()
+	ids := []PluginID{"plg_c", "plg_a", "plg_b"}
+	for _, id := range ids {
+		if _, err := st.Put(context.Background(), id, bytes.NewReader([]byte(string(id)))); err != nil {
+			t.Fatalf("Put(%s) error = %v", id, err)
+		}
+	}
+	got, err := st.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	want := []PluginID{"plg_a", "plg_b", "plg_c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("List() = %v, want %v", got, want)
 	}
 }

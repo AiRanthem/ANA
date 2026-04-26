@@ -19,6 +19,30 @@ const (
 	defaultMaxExpandedBytes = int64(256 << 20) // 256 MiB
 )
 
+func canonicalArchivePath(p string) (string, error) {
+	if !isSafeArchivePath(p) {
+		return "", fmt.Errorf("%w: invalid archive path %q", ErrCorruptArchive, p)
+	}
+	cp := path.Clean(p)
+	return cp, nil
+}
+
+func mapFileModeFromZip(f *zip.File) fs.FileMode {
+	mode := f.Mode()
+	if mode&fs.ModeDir != 0 {
+		perm := mode.Perm()
+		if perm == 0 {
+			perm = 0o755
+		}
+		return fs.ModeDir | perm
+	}
+	perm := mode.Perm()
+	if perm == 0 {
+		perm = 0o644
+	}
+	return perm
+}
+
 type zipReader struct {
 	manifest Manifest
 	filesys  fs.FS
@@ -66,6 +90,7 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 	var (
 		manifestBytes []byte
 		manifest      Manifest
+		seen          = make(map[string]struct{}, len(zr.File))
 		fileSet       = make(map[string]struct{}, len(zr.File))
 		filesys       = make(fstest.MapFS, len(zr.File))
 		totalExpanded int64
@@ -75,7 +100,15 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 		if err := validateZipFileHeader(f); err != nil {
 			return nil, err
 		}
-		fileSet[f.Name] = struct{}{}
+		canonicalName, err := canonicalArchivePath(f.Name)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[canonicalName]; exists {
+			return nil, fmt.Errorf("%w: duplicate zip path %q", ErrCorruptArchive, canonicalName)
+		}
+		seen[canonicalName] = struct{}{}
+		fileSet[canonicalName] = struct{}{}
 
 		rc, err := f.Open()
 		if err != nil {
@@ -103,12 +136,12 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 
 		totalExpanded += int64(len(body))
 
-		if f.Name == manifestPathDefault {
+		if canonicalName == manifestPathDefault {
 			manifestBytes = bytes.Clone(body)
 		}
-		filesys[f.Name] = &fstest.MapFile{
+		filesys[canonicalName] = &fstest.MapFile{
 			Data: body,
-			Mode: 0o644,
+			Mode: mapFileModeFromZip(f),
 		}
 	}
 
@@ -150,11 +183,15 @@ func validateManifestArchivePaths(m Manifest, fileSet map[string]struct{}) error
 	var errs []error
 	check := func(section Section, entries map[string]ManifestEntry) {
 		for key, entry := range entries {
-			p := path.Clean(entry.Path)
-			if _, ok := fileSet[p]; ok {
+			cleanPath, err := canonicalArchivePath(entry.Path)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s.%s.path %q is invalid", section, key, entry.Path))
 				continue
 			}
-			prefix := strings.TrimSuffix(p, "/") + "/"
+			if _, ok := fileSet[cleanPath]; ok {
+				continue
+			}
+			prefix := strings.TrimSuffix(cleanPath, "/") + "/"
 			found := false
 			for candidate := range fileSet {
 				if strings.HasPrefix(candidate, prefix) {

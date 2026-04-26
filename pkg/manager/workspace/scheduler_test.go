@@ -3,6 +3,8 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,5 +373,131 @@ func TestProbeSchedulerOpenFailureMarksFailed(t *testing.T) {
 	}
 	if got.StatusError == nil || got.StatusError.Phase != "probe" {
 		t.Fatalf("StatusError = %#v, want probe failure", got.StatusError)
+	}
+}
+
+func TestProbeScheduler_WatchdogUsesInitExpectation(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+	row := testWorkspace("wsp_watchdog_expect", "default", "wdog", StatusHealthy, now)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	err := repo.UpdateStatusCAS(
+		context.Background(),
+		row.ID,
+		StatusWriterScheduler,
+		StatusInit,
+		StatusFailed,
+		failureFromError(now, "install", ErrInstallTimeout),
+		time.Time{},
+	)
+	if !errors.Is(err, ErrStatusPreconditionFailed) {
+		t.Fatalf("UpdateStatusCAS() error = %v, want ErrStatusPreconditionFailed", err)
+	}
+}
+
+type casConflictRepo struct {
+	*MemoryRepository
+	mu sync.Mutex
+	n  int
+}
+
+func (r *casConflictRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
+	r.mu.Lock()
+	r.n++
+	n := r.n
+	r.mu.Unlock()
+	if n == 1 {
+		return fmt.Errorf("%w: forced conflict", ErrStatusPreconditionFailed)
+	}
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
+}
+
+func TestProbeScheduler_ProbeTransitionCASConflictIsHandled(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 13, 0, 0, 0, time.UTC)
+	base := NewMemoryRepository()
+	repo := &casConflictRepo{MemoryRepository: base}
+
+	specSet := agent.NewSpecSet()
+	spec := &fakeAgentSpec{
+		layout: &fakePluginLayout{},
+		probeFn: func(_ context.Context, ops infraops.InfraOps) (agent.ProbeResult, error) {
+			if ops.Dir() == "wsp_cas_conflict" {
+				return agent.ProbeResult{
+					Healthy: false,
+					Error: &agent.WorkspaceError{
+						Code:    "probe.unhealthy",
+						Message: "not ready",
+						Phase:   "probe",
+					},
+				}, nil
+			}
+			return agent.ProbeResult{Healthy: true}, nil
+		},
+	}
+	if err := specSet.Register(spec); err != nil {
+		t.Fatalf("Register(spec) error = %v", err)
+	}
+
+	registry := newFakeInfraRegistry()
+	factories := infraops.NewFactorySet()
+	if err := factories.Register(infraops.InfraType("localdir"), registry.factory()); err != nil {
+		t.Fatalf("Register(factory) error = %v", err)
+	}
+
+	scheduler, err := NewProbeScheduler(ProbeSchedulerConfig{
+		Repo:           repo,
+		AgentSpecs:     specSet,
+		Factories:      factories,
+		Clock:          func() time.Time { return now },
+		Interval:       time.Hour,
+		Timeout:        5 * time.Second,
+		InstallTimeout: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewProbeScheduler() error = %v", err)
+	}
+
+	row := Workspace{
+		ID:           "wsp_cas_conflict",
+		Namespace:    Namespace("default"),
+		Alias:        "cas-conflict",
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": "wsp_cas_conflict"},
+		Status:       StatusHealthy,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	if err := scheduler.runTick(context.Background()); err != nil {
+		t.Fatalf("runTick(1) error = %v", err)
+	}
+	got1, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() after first tick error = %v", err)
+	}
+	if got1.Status != StatusHealthy {
+		t.Fatalf("after first tick status = %q, want healthy (CAS conflict ignored)", got1.Status)
+	}
+
+	if err := scheduler.runTick(context.Background()); err != nil {
+		t.Fatalf("runTick(2) error = %v", err)
+	}
+	got2, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() after second tick error = %v", err)
+	}
+	if got2.Status != StatusFailed {
+		t.Fatalf("after second tick status = %q, want failed", got2.Status)
 	}
 }

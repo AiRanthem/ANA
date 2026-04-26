@@ -23,7 +23,7 @@ func NewSpecSet() *SpecSet {
 // Register stores a spec by its Type.
 func (s *SpecSet) Register(spec AgentSpec) error {
 	if spec == nil {
-		return fmt.Errorf("%w: nil spec", ErrAgentTypeUnknown)
+		return fmt.Errorf("%w: nil spec", ErrInvalidAgentSpec)
 	}
 
 	agentType := spec.Type()
@@ -32,7 +32,7 @@ func (s *SpecSet) Register(spec AgentSpec) error {
 	}
 
 	if spec.DisplayName() == "" {
-		return fmt.Errorf("%w: empty display name for %q", ErrAgentTypeUnknown, agentType)
+		return fmt.Errorf("%w: empty display name for %q", ErrInvalidAgentSpec, agentType)
 	}
 
 	if spec.PluginLayout() == nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -108,10 +109,16 @@ func TestValidateAgentType(t *testing.T) {
 			t.Parallel()
 
 			err := ValidateAgentType(tc.agentType)
-			if tc.wantErr && err == nil {
-				t.Fatalf("expected error, got nil")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if !errors.Is(err, ErrInvalidAgentType) {
+					t.Fatalf("expected ErrInvalidAgentType, got %v", err)
+				}
+				return
 			}
-			if !tc.wantErr && err != nil {
+			if err != nil {
 				t.Fatalf("expected nil error, got %v", err)
 			}
 		})
@@ -132,6 +139,18 @@ func TestValidateProtocolDescriptor(t *testing.T) {
 				Kind: ProtocolKindCLI,
 				Detail: map[string]any{
 					"command": []any{"claude", "code"},
+				},
+			},
+		},
+		{
+			name: "valid go typed collections",
+			desc: ProtocolDescriptor{
+				Kind: ProtocolKindCLI,
+				Detail: map[string]any{
+					"command": []string{"claude", "code"},
+					"env": map[string]string{
+						"A": "1",
+					},
 				},
 			},
 		},
@@ -170,5 +189,82 @@ func TestValidateProtocolDescriptor(t *testing.T) {
 				t.Fatalf("expected nil error, got %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateProtocolDescriptor_RejectsNonFiniteFloats(t *testing.T) {
+	t.Parallel()
+
+	cases := []ProtocolDescriptor{
+		{Kind: ProtocolKindCLI, Detail: map[string]any{"x": math.NaN()}},
+		{Kind: ProtocolKindCLI, Detail: map[string]any{"x": math.Inf(1)}},
+		{Kind: ProtocolKindCLI, Detail: map[string]any{"x": math.Inf(-1)}},
+		{Kind: ProtocolKindCLI, Detail: map[string]any{"x": []any{1, math.Inf(-1)}}},
+		{Kind: ProtocolKindCLI, Detail: map[string]any{"x": map[string]any{"y": float32(math.NaN())}}},
+	}
+
+	for _, c := range cases {
+		err := ValidateProtocolDescriptor(c)
+		if err == nil {
+			t.Fatalf("expected error for %v", c.Detail)
+		}
+		if !errors.Is(err, ErrInvalidProtocolDescriptor) {
+			t.Fatalf("want ErrInvalidProtocolDescriptor, got %v", err)
+		}
+	}
+}
+
+func TestValidateProtocolDescriptor_AcceptsFiniteFloats(t *testing.T) {
+	t.Parallel()
+
+	desc := ProtocolDescriptor{
+		Kind: ProtocolKindCLI,
+		Detail: map[string]any{
+			"x": 1.5,
+			"y": float32(2.25),
+			"z": map[string]any{"w": []any{0.0, -3.14}},
+		},
+	}
+	if err := ValidateProtocolDescriptor(desc); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestSpecSetRegister_ErrorClassification(t *testing.T) {
+	t.Parallel()
+
+	s := NewSpecSet()
+	if err := s.Register(nil); !errors.Is(err, ErrInvalidAgentSpec) {
+		t.Fatalf("Register(nil): want ErrInvalidAgentSpec, got %v", err)
+	}
+
+	errBadType := s.Register(fakeSpec{
+		agentType:   "Bad_Type",
+		displayName: "x",
+		layout:      fakeLayout{},
+		desc:        ProtocolDescriptor{Kind: ProtocolKindCLI},
+	})
+	if !errors.Is(errBadType, ErrInvalidAgentType) {
+		t.Fatalf("Register invalid type: want ErrInvalidAgentType, got %v", errBadType)
+	}
+
+	errEmptyName := s.Register(fakeSpec{
+		agentType:   "claude-code",
+		displayName: "",
+		layout:      fakeLayout{},
+		desc:        ProtocolDescriptor{Kind: ProtocolKindCLI},
+	})
+	if !errors.Is(errEmptyName, ErrInvalidAgentSpec) {
+		t.Fatalf("empty display name: want ErrInvalidAgentSpec, got %v", errEmptyName)
+	}
+}
+
+func TestSpecSetLookup_ReturnsUnknown(t *testing.T) {
+	t.Parallel()
+
+	s := NewSpecSet()
+	_, err := s.Lookup("missing-type")
+	if !errors.Is(err, ErrAgentTypeUnknown) {
+		t.Fatalf("want ErrAgentTypeUnknown, got %v", err)
 	}
 }

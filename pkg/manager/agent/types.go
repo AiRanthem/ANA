@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"math"
+	"reflect"
 	"regexp"
 	"time"
 
@@ -112,6 +114,10 @@ var (
 	ErrAgentTypeConflict = errors.New("agent: agent type conflict")
 	// ErrAgentTypeUnknown indicates a lookup miss for an unregistered type.
 	ErrAgentTypeUnknown = errors.New("agent: agent type unknown")
+	// ErrInvalidAgentType indicates an agent type string that violates naming rules.
+	ErrInvalidAgentType = errors.New("agent: invalid agent type")
+	// ErrInvalidAgentSpec indicates invalid AgentSpec input (for example nil or empty display name).
+	ErrInvalidAgentSpec = errors.New("agent: invalid agent spec")
 	// ErrInvalidProtocolDescriptor indicates a malformed protocol descriptor.
 	ErrInvalidProtocolDescriptor = errors.New("agent: invalid protocol descriptor")
 	// ErrInvalidPluginLayout indicates a spec returned an unusable PluginLayout.
@@ -123,7 +129,7 @@ var agentTypePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 // ValidateAgentType enforces the manager-wide type format.
 func ValidateAgentType(agentType AgentType) error {
 	if !agentTypePattern.MatchString(string(agentType)) {
-		return fmt.Errorf("%w: %q", ErrAgentTypeUnknown, agentType)
+		return fmt.Errorf("%w: %q", ErrInvalidAgentType, agentType)
 	}
 	return nil
 }
@@ -162,25 +168,48 @@ func cloneProbeDetail(detail map[string]string) map[string]string {
 }
 
 func validateJSONCompatibleValue(v any) error {
-	switch x := v.(type) {
-	case nil, bool, string,
-		float64, float32,
+	if v == nil {
+		return nil
+	}
+
+	switch n := v.(type) {
+	case bool, string,
 		int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64:
 		return nil
-	case []any:
-		for idx, elem := range x {
-			if err := validateJSONCompatibleValue(elem); err != nil {
+	case float32:
+		f := float64(n)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("non-finite float32 %v", n)
+		}
+		return nil
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return fmt.Errorf("non-finite float64 %v", n)
+		}
+		return nil
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		for idx := 0; idx < rv.Len(); idx++ {
+			if err := validateJSONCompatibleValue(rv.Index(idx).Interface()); err != nil {
 				return fmt.Errorf("array[%d]: %w", idx, err)
 			}
 		}
 		return nil
-	case map[string]any:
-		for key, value := range x {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return fmt.Errorf("unsupported map key type %s", rv.Type().Key())
+		}
+		iter := rv.MapRange()
+		for iter.Next() {
+			key := iter.Key().String()
 			if key == "" {
 				return errors.New("empty map key")
 			}
-			if err := validateJSONCompatibleValue(value); err != nil {
+			if err := validateJSONCompatibleValue(iter.Value().Interface()); err != nil {
 				return fmt.Errorf("map[%q]: %w", key, err)
 			}
 		}

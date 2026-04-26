@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -169,12 +170,12 @@ func TestInstallAndLayout_WriteExpectedFiles(t *testing.T) {
 		t.Fatalf("missing top-level AGENTS.md")
 	}
 	wantAgents := "# Workspace AGENTS\n\n" +
-		"alias: workspace-alpha\n" +
-		"namespace: team-one\n" +
+		"alias: \"workspace-alpha\"\n" +
+		"namespace: \"team-one\"\n" +
 		"agent_type: claude-code\n\n" +
 		"attached_plugins:\n" +
-		"- alpha\n" +
-		"- zeta\n"
+		"- \"alpha\"\n" +
+		"- \"zeta\"\n"
 	if string(agentsDoc) != wantAgents {
 		t.Fatalf("unexpected AGENTS.md content:\n%s", string(agentsDoc))
 	}
@@ -212,6 +213,31 @@ func TestPluginLayoutApply_RejectsSanitizedNameCollision(t *testing.T) {
 	}
 	if ops.putCalls != putCountAfterFirst {
 		t.Fatalf("expected no writes on collision, got before=%d after=%d", putCountAfterFirst, ops.putCalls)
+	}
+}
+
+func TestPluginLayoutApply_RejectsOccupiedDirectoryWithoutManifest(t *testing.T) {
+	t.Parallel()
+
+	spec, err := New(Options{})
+	if err != nil {
+		t.Fatalf("new spec: %v", err)
+	}
+	layout := spec.PluginLayout()
+	ops := newFakeInfraOps()
+	ops.markDir(".claude/plugins/market-research")
+
+	root := pluginFS("market--research", map[string]string{
+		"skills/s1/SKILL.md": "skill",
+	})
+	manifest := mustManifestFromFS(t, root)
+
+	_, err = layout.Apply(context.Background(), ops, manifest, root)
+	if !errors.Is(err, ErrInvalidPluginLayout) {
+		t.Fatalf("want ErrInvalidPluginLayout, got %v", err)
+	}
+	if ops.putCalls != 0 {
+		t.Fatalf("expected no writes, got %d", ops.putCalls)
 	}
 }
 
@@ -315,6 +341,30 @@ func TestClaudeCodeLayoutDuplicatePluginCollision(t *testing.T) {
 	}
 	if ops.putCalls != putAfterFirst {
 		t.Fatalf("putCalls after collision = %d, want %d (no writes)", ops.putCalls, putAfterFirst)
+	}
+}
+
+func TestPluginLayoutApply_RejectsNonCanonicalNestedPaths(t *testing.T) {
+	t.Parallel()
+
+	spec, err := New(Options{})
+	if err != nil {
+		t.Fatalf("new spec: %v", err)
+	}
+	layout := spec.PluginLayout()
+	ops := newFakeInfraOps()
+
+	root := pluginFS("nested-extra", map[string]string{
+		"notes/internal.txt": "should be rejected\n",
+	})
+	manifest := mustManifestFromFS(t, root)
+
+	_, err = layout.Apply(context.Background(), ops, manifest, root)
+	if !errors.Is(err, ErrInvalidPluginLayout) {
+		t.Fatalf("apply: got %v, want ErrInvalidPluginLayout", err)
+	}
+	if ops.putCalls != 0 {
+		t.Fatalf("expected no writes on invalid nested path, got %d", ops.putCalls)
 	}
 }
 
@@ -424,12 +474,41 @@ func TestLayoutPaths_Deterministic(t *testing.T) {
 	}
 }
 
+func TestRenderWorkspaceAgents_EscapesUntrustedFields(t *testing.T) {
+	t.Parallel()
+
+	doc := string(renderWorkspaceAgents(agent.WorkspaceSummary{
+		Alias:     "ws\n- injected",
+		Namespace: "team\n# injected",
+		Plugins: []agent.AttachedPluginRef{
+			{Name: "plugin\n- pwn"},
+		},
+	}))
+
+	if strings.Contains(doc, "\n- injected\n") {
+		t.Fatalf("alias should not inject markdown list item:\n%s", doc)
+	}
+	if strings.Contains(doc, "\n# injected\n") {
+		t.Fatalf("namespace should not inject markdown heading:\n%s", doc)
+	}
+	if strings.Contains(doc, "\n- pwn\n") {
+		t.Fatalf("plugin name should not inject markdown list item:\n%s", doc)
+	}
+	if !strings.Contains(doc, "alias: \"ws\\n- injected\"") {
+		t.Fatalf("alias should be escaped:\n%s", doc)
+	}
+	if !strings.Contains(doc, "- \"plugin\\n- pwn\"") {
+		t.Fatalf("plugin should be escaped:\n%s", doc)
+	}
+}
+
 type fakeInfraOps struct {
 	dir string
 
 	execFn       func(ctx context.Context, cmd infraops.ExecCommand) (infraops.ExecResult, error)
 	execCommands []infraops.ExecCommand
 
+	dirs     map[string]struct{}
 	files    map[string][]byte
 	putCalls int
 }
@@ -438,8 +517,11 @@ func newFakeInfraOps() *fakeInfraOps {
 	return &fakeInfraOps{
 		dir:   "/tmp/fake",
 		files: make(map[string][]byte),
+		dirs:  make(map[string]struct{}),
 	}
 }
+
+func (f *fakeInfraOps) markDir(p string) { f.dirs[p] = struct{}{} }
 
 func (f *fakeInfraOps) Type() infraops.InfraType { return "fake" }
 func (f *fakeInfraOps) Dir() string              { return f.dir }
@@ -475,6 +557,9 @@ func (f *fakeInfraOps) PutFile(ctx context.Context, path string, content io.Read
 func (f *fakeInfraOps) GetFile(ctx context.Context, path string) (io.ReadCloser, error) {
 	_ = ctx
 
+	if _, ok := f.dirs[path]; ok {
+		return nil, infraops.ErrNotARegularFile
+	}
 	data, ok := f.files[path]
 	if !ok {
 		return nil, fs.ErrNotExist

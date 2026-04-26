@@ -130,10 +130,10 @@ func isSafeArchivePath(p string) bool {
 	if strings.HasPrefix(p, "/") {
 		return false
 	}
-	// Reject dot-segments in the raw manifest path before path.Clean, which
-	// collapses "skills/../x" into "skills/x" and would otherwise hide escapes.
+	// Reject dot-segments and empty segments in the raw path before path.Clean,
+	// which collapses "skills/../x" into "skills/x" and would otherwise hide escapes.
 	for _, seg := range strings.Split(p, "/") {
-		if seg == ".." {
+		if seg == "" || seg == "." || seg == ".." {
 			return false
 		}
 	}

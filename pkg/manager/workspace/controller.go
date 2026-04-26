@@ -471,26 +471,42 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		return
 	}
 
-	updated := cloneWorkspace(job.workspace)
-	updated.Plugins = attachedPlugins
-	updated.UpdatedAt = c.clock()
+	latest, err := c.repo.Get(persistCtx, job.workspace.ID)
+	if err != nil {
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID,
+			failureFromError(c.clock(), "install", fmt.Errorf("reload before finalize: %w", err)),
+			time.Time{},
+		)
+		return
+	}
+	if latest.Status != StatusInit {
+		// Snapshot expired (for example install watchdog moved init -> failed); do not promote status.
+		return
+	}
+
+	latest.Plugins = attachedPlugins
+	latest.UpdatedAt = c.clock()
 	if err := c.retryRepoWrite(persistCtx, installCtx, "persist_attached_plugins", func(ctx context.Context) error {
-		return c.repo.Update(ctx, updated)
+		return c.repo.Update(ctx, latest)
 	}); err != nil {
 		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("persist attached plugins: %w", err)), time.Time{})
 		return
 	}
 
 	if err := c.retryRepoWrite(persistCtx, installCtx, "update_status_healthy", func(ctx context.Context) error {
-		return c.repo.UpdateStatus(ctx, updated.ID, StatusHealthy, nil, probedAt)
+		err := c.repo.UpdateStatusCAS(ctx, latest.ID, StatusWriterController, StatusInit, StatusHealthy, nil, probedAt)
+		if errors.Is(err, ErrStatusPreconditionFailed) {
+			return nil
+		}
+		return err
 	}); err != nil {
 		logs.FromContext(installCtx).Error("workspace healthy transition failed",
 			"component", "workspace_controller",
-			"workspace_id", updated.ID,
-			"workspace_alias", updated.Alias,
-			"namespace", updated.Namespace,
-			"agent_type", updated.AgentType,
-			"infra_type", updated.InfraType,
+			"workspace_id", latest.ID,
+			"workspace_alias", latest.Alias,
+			"namespace", latest.Namespace,
+			"agent_type", latest.AgentType,
+			"infra_type", latest.InfraType,
 			"phase", "status",
 			"err", err,
 		)
@@ -599,7 +615,11 @@ func (c *Controller) transitionToFailed(repoCtx, logCtx context.Context, id Work
 		logCtx = repoCtx
 	}
 	if err := c.retryRepoWrite(repoCtx, logCtx, "update_status_failed", func(ctx context.Context) error {
-		return c.repo.UpdateStatus(ctx, id, StatusFailed, statusErr, lastProbeAt)
+		err := c.repo.UpdateStatusCAS(ctx, id, StatusWriterController, StatusInit, StatusFailed, statusErr, lastProbeAt)
+		if errors.Is(err, ErrStatusPreconditionFailed) {
+			return nil
+		}
+		return err
 	}); err != nil {
 		logs.FromContext(logCtx).Error("workspace failed transition failed",
 			"component", "workspace_controller",

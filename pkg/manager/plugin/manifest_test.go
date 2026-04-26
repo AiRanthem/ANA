@@ -84,6 +84,17 @@ func TestValidateManifest_Errors(t *testing.T) {
 			want: "invalid",
 		},
 		{
+			name: "path with single dot segment",
+			m: Manifest{
+				SchemaVersion: 1,
+				Plugin:        ManifestPlugin{Name: "ok"},
+				Skills: map[string]ManifestEntry{
+					"bad": {Path: "skills/./x"},
+				},
+			},
+			want: "invalid",
+		},
+		{
 			name: "nested array metadata unsupported",
 			m: Manifest{
 				SchemaVersion: 1,

@@ -149,7 +149,10 @@ func buildWritePlan(pluginRoot fs.FS, pluginBase string) ([]writePlan, error) {
 			return nil
 		}
 
-		targetPath := mapPath(pluginBase, srcPath)
+		targetPath, err := mapPath(pluginBase, srcPath)
+		if err != nil {
+			return err
+		}
 		if previous, exists := targets[targetPath]; exists {
 			return fmt.Errorf("%w: target path collision %q from %q and %q", ErrInvalidPluginLayout, targetPath, previous, srcPath)
 		}
@@ -183,20 +186,24 @@ func buildWritePlan(pluginRoot fs.FS, pluginBase string) ([]writePlan, error) {
 	return planned, nil
 }
 
-func mapPath(pluginBase, srcPath string) string {
+func mapPath(pluginBase, srcPath string) (string, error) {
 	clean := path.Clean(srcPath)
 	switch clean {
 	case manifestFile, "AGENTS.md", "README.md":
-		return path.Join(pluginBase, clean)
+		return path.Join(pluginBase, clean), nil
 	}
 
 	for _, section := range canonicalSectionRoots {
 		if clean == section || strings.HasPrefix(clean, section+"/") {
-			return path.Join(pluginBase, clean)
+			return path.Join(pluginBase, clean), nil
 		}
 	}
 
-	return path.Join(pluginBase, clean)
+	// Only root-level extra files are allowed outside canonical sections.
+	if strings.Contains(clean, "/") {
+		return "", fmt.Errorf("%w: non-canonical nested path %q", ErrInvalidPluginLayout, srcPath)
+	}
+	return path.Join(pluginBase, clean), nil
 }
 
 func fileMode(d fs.DirEntry) (fs.FileMode, error) {
@@ -213,20 +220,39 @@ func fileMode(d fs.DirEntry) (fs.FileMode, error) {
 }
 
 func ensureNoPluginNameCollision(ctx context.Context, ops infraops.InfraOps, pluginBase string) error {
-	manifestPath := path.Join(pluginBase, manifestFile)
-	content, err := ops.GetFile(ctx, manifestPath)
-	if err == nil {
-		_ = content.Close()
+	occupied, err := pathOccupied(ctx, ops, pluginBase)
+	if err != nil {
+		return fmt.Errorf("claudecode layout check plugin base %q: %w", pluginBase, err)
+	}
+	if occupied {
 		return fmt.Errorf("%w: plugin directory collision %q", ErrInvalidPluginLayout, pluginBase)
 	}
 
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+	manifestPath := path.Join(pluginBase, manifestFile)
+	occupied, err = pathOccupied(ctx, ops, manifestPath)
+	if err != nil {
+		return fmt.Errorf("claudecode layout check existing plugin %q: %w", pluginBase, err)
 	}
-	if errors.Is(err, infraops.ErrNotARegularFile) {
+	if occupied {
 		return fmt.Errorf("%w: plugin directory collision %q", ErrInvalidPluginLayout, pluginBase)
 	}
-	return fmt.Errorf("claudecode layout check existing plugin %q: %w", pluginBase, err)
+
+	return nil
+}
+
+func pathOccupied(ctx context.Context, ops infraops.InfraOps, p string) (bool, error) {
+	rc, err := ops.GetFile(ctx, p)
+	if err == nil {
+		_ = rc.Close()
+		return true, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if errors.Is(err, infraops.ErrNotARegularFile) {
+		return true, nil
+	}
+	return false, err
 }
 
 func sanitizePluginName(name string) string {

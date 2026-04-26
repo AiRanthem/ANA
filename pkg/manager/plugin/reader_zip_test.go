@@ -178,4 +178,119 @@ path = "`+skillPath+`"
 `) + "\n"
 }
 
+type zipEntry struct {
+	name string
+	body []byte
+	mode fs.FileMode
+}
+
+func buildZipWithDuplicate(t *testing.T, entries ...zipEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range entries {
+		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		mode := e.mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		h.SetMode(mode)
+		w, err := zw.CreateHeader(h)
+		if err != nil {
+			t.Fatalf("CreateHeader(%s): %v", e.name, err)
+		}
+		if _, err := w.Write(e.body); err != nil {
+			t.Fatalf("Write(%s): %v", e.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Close zip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func buildZipWithMode(t *testing.T, entries []zipEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range entries {
+		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		mode := e.mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		h.SetMode(mode)
+		w, err := zw.CreateHeader(h)
+		if err != nil {
+			t.Fatalf("CreateHeader(%s): %v", e.name, err)
+		}
+		if _, err := w.Write(e.body); err != nil {
+			t.Fatalf("Write(%s): %v", e.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Close zip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestOpenZipReader_RejectsDuplicateEntries(t *testing.T) {
+	t.Parallel()
+	zipBytes := buildZipWithDuplicate(t,
+		zipEntry{name: "manifest.toml", body: []byte(validManifest("demo", "skills/s1"))},
+		zipEntry{name: "manifest.toml", body: []byte(validManifest("demo2", "skills/s1"))},
+		zipEntry{name: "skills/s1/SKILL.md", body: []byte("# skill")},
+	)
+	_, err := OpenZipReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if !errors.Is(err, ErrCorruptArchive) {
+		t.Fatalf("OpenZipReader() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
+func TestOpenZipReader_RejectsDotSegmentPathInArchive(t *testing.T) {
+	t.Parallel()
+	zipBytes := buildZip(t, map[string][]byte{
+		"manifest.toml":        []byte(validManifest("p1", "skills/s1")),
+		"skills/./s1/SKILL.md": []byte("# skill"),
+		"skills/s1/SKILL.md":   []byte("# other"),
+	})
+	_, err := OpenZipReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if !errors.Is(err, ErrCorruptArchive) {
+		t.Fatalf("OpenZipReader() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
+func TestOpenZipReader_RejectsDotSegmentPathInManifest(t *testing.T) {
+	t.Parallel()
+	zipBytes := buildZip(t, map[string][]byte{
+		"manifest.toml":      []byte(validManifest("p1", "skills/./s1")),
+		"skills/s1/SKILL.md": []byte("# skill"),
+	})
+	_, err := OpenZipReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("OpenZipReader() error = %v, want ErrInvalidManifest", err)
+	}
+}
+
+func TestOpenZipReader_PreservesExecutableBit(t *testing.T) {
+	t.Parallel()
+	zipBytes := buildZipWithMode(t, []zipEntry{
+		{name: "manifest.toml", body: []byte(validManifest("demo", "skills/s1")), mode: 0o644},
+		{name: "skills/s1/run.sh", body: []byte("#!/bin/sh\necho hi\n"), mode: 0o755},
+	})
+	r, err := OpenZipReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		t.Fatalf("OpenZipReader() error = %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	info, err := fs.Stat(r.FS(), "skills/s1/run.sh")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("mode = %v, want executable bit", info.Mode())
+	}
+}
+
 var _ fs.FS = fstest.MapFS{}

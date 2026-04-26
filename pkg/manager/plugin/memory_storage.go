@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sort"
 	"sync"
 )
 
@@ -98,6 +99,9 @@ func (s *MemoryStorage) List(_ context.Context) ([]PluginID, error) {
 	for id := range s.blobs {
 		out = append(out, id)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return string(out[i]) < string(out[j])
+	})
 	return out, nil
 }
 

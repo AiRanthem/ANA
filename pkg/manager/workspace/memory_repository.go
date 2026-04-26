@@ -204,6 +204,68 @@ func (r *MemoryRepository) UpdateStatus(_ context.Context, id WorkspaceID, statu
 	return nil
 }
 
+func (r *MemoryRepository) UpdateStatusCAS(
+	_ context.Context,
+	id WorkspaceID,
+	writer StatusWriter,
+	expect Status,
+	next Status,
+	statusError *Error,
+	lastProbeAt time.Time,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return errRepositoryClosed
+	}
+	row, ok := r.byID[id]
+	if !ok {
+		return ErrWorkspaceNotFound
+	}
+	if row.Status != expect {
+		return fmt.Errorf("%w: workspace %q current=%q expect=%q",
+			ErrStatusPreconditionFailed, id, row.Status, expect)
+	}
+	if err := validateKnownStatus(next); err != nil {
+		return err
+	}
+	if err := validateTransitionByWriter(writer, expect, next); err != nil {
+		return err
+	}
+
+	row.Status = next
+	row.LastProbeAt = lastProbeAt
+	row.UpdatedAt = time.Now().UTC()
+	if next == StatusHealthy {
+		row.StatusError = nil
+	} else {
+		row.StatusError = cloneError(statusError)
+	}
+	r.byID[id] = row
+	return nil
+}
+
+func validateTransitionByWriter(writer StatusWriter, from, to Status) error {
+	switch writer {
+	case StatusWriterController:
+		if from == StatusInit && (to == StatusHealthy || to == StatusFailed) {
+			return nil
+		}
+	case StatusWriterScheduler:
+		if from == StatusInit && to == StatusFailed {
+			return nil
+		}
+		if from == StatusHealthy && to == StatusFailed {
+			return nil
+		}
+		if from == StatusFailed && to == StatusHealthy {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: writer=%q %q->%q", ErrInvalidStatusTransition, writer, from, to)
+}
+
 func (r *MemoryRepository) Delete(_ context.Context, id WorkspaceID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -129,6 +129,90 @@ func TestMemoryRepository_UpdateStatusTransitions(t *testing.T) {
 	}
 }
 
+func TestMemoryRepository_UpdateStatusCAS_RejectsWrongExpectedStatus(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 10, 0, 0, 0, time.UTC)
+	repo := NewMemoryRepository()
+	row := testWorkspace("wsp_cas_expect", "default", "alpha", StatusHealthy, now)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	err := repo.UpdateStatusCAS(context.Background(), row.ID, StatusWriterScheduler, StatusInit, StatusFailed, nil, time.Time{})
+	if !errors.Is(err, ErrStatusPreconditionFailed) {
+		t.Fatalf("UpdateStatusCAS() error = %v, want ErrStatusPreconditionFailed", err)
+	}
+}
+
+func TestMemoryRepository_UpdateStatusCAS_RejectsWriterForbiddenTransition(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 10, 0, 0, 0, time.UTC)
+	repo := NewMemoryRepository()
+	row := testWorkspace("wsp_cas_writer", "default", "alpha", StatusInit, now)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	err := repo.UpdateStatusCAS(context.Background(), row.ID, StatusWriterScheduler, StatusInit, StatusHealthy, nil, time.Time{})
+	if !errors.Is(err, ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatusCAS() error = %v, want ErrInvalidStatusTransition", err)
+	}
+}
+
+func TestMemoryRepository_UpdateStatusCAS_AllowsControllerInitToHealthy(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 10, 0, 0, 0, time.UTC)
+	repo := NewMemoryRepository()
+	row := testWorkspace("wsp_cas_ctrl_ok", "default", "alpha", StatusInit, now)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	probedAt := now.Add(time.Second)
+	if err := repo.UpdateStatusCAS(context.Background(), row.ID, StatusWriterController, StatusInit, StatusHealthy, nil, probedAt); err != nil {
+		t.Fatalf("UpdateStatusCAS() error = %v", err)
+	}
+	got, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.Status != StatusHealthy {
+		t.Fatalf("Status = %q, want healthy", got.Status)
+	}
+	if !got.LastProbeAt.Equal(probedAt) {
+		t.Fatalf("LastProbeAt = %v, want %v", got.LastProbeAt, probedAt)
+	}
+}
+
+func TestMemoryRepository_UpdateStatusCAS_AllowsSchedulerFailedToHealthy(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 10, 0, 0, 0, time.UTC)
+	repo := NewMemoryRepository()
+	row := testWorkspace("wsp_cas_sched_ok", "default", "alpha", StatusFailed, now)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	probedAt := now.Add(2 * time.Second)
+	if err := repo.UpdateStatusCAS(context.Background(), row.ID, StatusWriterScheduler, StatusFailed, StatusHealthy, nil, probedAt); err != nil {
+		t.Fatalf("UpdateStatusCAS() error = %v", err)
+	}
+	got, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.Status != StatusHealthy {
+		t.Fatalf("Status = %q, want healthy", got.Status)
+	}
+	if got.StatusError != nil {
+		t.Fatalf("StatusError = %#v, want nil", got.StatusError)
+	}
+}
+
 func TestMemoryRepository_UpdateRejectsStatusMutation(t *testing.T) {
 	t.Parallel()
 

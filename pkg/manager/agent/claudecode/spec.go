@@ -9,6 +9,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -276,8 +277,8 @@ func renderWorkspaceAgents(workspace agent.WorkspaceSummary) []byte {
 
 	var b strings.Builder
 	b.WriteString("# Workspace AGENTS\n\n")
-	b.WriteString(fmt.Sprintf("alias: %s\n", workspace.Alias))
-	b.WriteString(fmt.Sprintf("namespace: %s\n", workspace.Namespace))
+	b.WriteString(fmt.Sprintf("alias: %s\n", quoteAgentDocValue(string(workspace.Alias))))
+	b.WriteString(fmt.Sprintf("namespace: %s\n", quoteAgentDocValue(string(workspace.Namespace))))
 	b.WriteString("agent_type: claude-code\n\n")
 	b.WriteString("attached_plugins:\n")
 	if len(pluginNames) == 0 {
@@ -286,10 +287,14 @@ func renderWorkspaceAgents(workspace agent.WorkspaceSummary) []byte {
 	}
 	for _, name := range pluginNames {
 		b.WriteString("- ")
-		b.WriteString(name)
+		b.WriteString(quoteAgentDocValue(name))
 		b.WriteByte('\n')
 	}
 	return []byte(b.String())
+}
+
+func quoteAgentDocValue(value string) string {
+	return strconv.Quote(value)
 }
 
 func firstNonEmptyLine(value string) string {

@@ -28,6 +28,16 @@ const (
 	StatusFailed  Status = "failed"
 )
 
+// StatusWriter identifies which component performs a CAS status transition.
+type StatusWriter string
+
+const (
+	// StatusWriterController may transition init -> {healthy, failed}.
+	StatusWriterController StatusWriter = "controller"
+	// StatusWriterScheduler may transition init -> failed (watchdog), healthy <-> failed.
+	StatusWriterScheduler StatusWriter = "scheduler"
+)
+
 // Error is the persisted workspace error record.
 type Error = agent.WorkspaceError
 
@@ -77,6 +87,15 @@ type Repository interface {
 	List(ctx context.Context, opts ListOptions) ([]Workspace, string, error)
 	Update(ctx context.Context, w Workspace) error
 	UpdateStatus(ctx context.Context, id WorkspaceID, status Status, statusError *Error, lastProbeAt time.Time) error
+	UpdateStatusCAS(
+		ctx context.Context,
+		id WorkspaceID,
+		writer StatusWriter,
+		expect Status,
+		next Status,
+		statusError *Error,
+		lastProbeAt time.Time,
+	) error
 	Delete(ctx context.Context, id WorkspaceID) error
 	Close(ctx context.Context) error
 }
@@ -90,6 +109,8 @@ var (
 	ErrAliasConflict = errors.New("workspace: alias conflict")
 	// ErrInvalidStatusTransition indicates a status transition outside the documented state machine.
 	ErrInvalidStatusTransition = errors.New("workspace: invalid status transition")
+	// ErrStatusPreconditionFailed indicates the row status did not match the expected value for a CAS write.
+	ErrStatusPreconditionFailed = errors.New("workspace: status precondition failed")
 	// ErrInstallTimeout marks workspaces that stayed in init beyond the configured install timeout.
 	ErrInstallTimeout = errors.New("workspace: install timeout")
 	// ErrControllerShutdown indicates the controller has been stopped and rejects new submissions.

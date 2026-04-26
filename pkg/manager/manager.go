@@ -195,9 +195,6 @@ func (b *Builder) Build(ctx context.Context) (Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", opBuild, err)
 	}
-	if err := controller.Start(ctx); err != nil {
-		return nil, fmt.Errorf("%s: %w", opBuild, err)
-	}
 
 	scheduler, err := workspace.NewProbeScheduler(workspace.ProbeSchedulerConfig{
 		Repo:           b.WorkspaceRepository,
@@ -210,7 +207,6 @@ func (b *Builder) Build(ctx context.Context) (Manager, error) {
 		InstallTimeout: b.InstallTimeout,
 	})
 	if err != nil {
-		_ = controller.Stop(ctx)
 		return nil, fmt.Errorf("%s: %w", opBuild, err)
 	}
 
@@ -439,10 +435,10 @@ func (m *managerFacade) DeletePlugin(ctx context.Context, id PluginID) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", opDeletePlugin, err)
 	}
-	if err := m.pluginRepository.Delete(ctx, row.ID); err != nil {
+	if err := m.pluginStorage.Delete(ctx, row.ID); err != nil && !errors.Is(err, plugin.ErrStorageNotFound) {
 		return fmt.Errorf("%s: %w", opDeletePlugin, err)
 	}
-	if err := m.pluginStorage.Delete(ctx, row.ID); err != nil {
+	if err := m.pluginRepository.Delete(ctx, row.ID); err != nil {
 		return fmt.Errorf("%s: %w", opDeletePlugin, err)
 	}
 	return nil
@@ -561,33 +557,14 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 	}
 
 	if err := m.controller.Submit(context.Background(), row, params); err != nil {
-		if errors.Is(err, workspace.ErrControllerShutdown) {
-			// Controller shutdown during enqueue: the caller was told the workspace was not created,
-			// so we must delete the inserted row to free the alias for retry.
-			if deleteErr := m.workspaceRepository.Delete(context.Background(), row.ID); deleteErr != nil {
-				logs.FromContext(ctx).Error("failed to delete workspace row after shutdown enqueue failure",
-					"op", opCreateWorkspace,
-					"component", "manager.workspace",
-					"workspace_id", row.ID,
-					"workspace_alias", row.Alias,
-					"namespace", row.Namespace,
-					"err", deleteErr,
-				)
-			}
-			return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
-		}
-		// Non-shutdown install failures: mark as failed so the workspace record persists.
-		statusErr := newWorkspaceError(m.clock(), "install.error", "install", err.Error())
-		if updateErr := m.workspaceRepository.UpdateStatus(context.Background(), row.ID, workspace.StatusFailed, workspaceErrorToRow(statusErr), time.Time{}); updateErr != nil {
-			logs.FromContext(ctx).Error("workspace submission failure transition failed",
+		if deleteErr := m.workspaceRepository.Delete(context.Background(), row.ID); deleteErr != nil {
+			logs.FromContext(ctx).Error("failed to delete workspace row after submit failure",
 				"op", opCreateWorkspace,
 				"component", "manager.workspace",
 				"workspace_id", row.ID,
 				"workspace_alias", row.Alias,
 				"namespace", row.Namespace,
-				"agent_type", row.AgentType,
-				"infra_type", row.InfraType,
-				"err", updateErr,
+				"err", deleteErr,
 			)
 		}
 		return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
@@ -687,12 +664,16 @@ func (m *managerFacade) Start(ctx context.Context) error {
 	if err := m.ensureAvailable(opStart); err != nil {
 		return err
 	}
-	if err := m.controller.Start(ctx); err != nil {
+	if err := m.controller.Start(m.buildCtx); err != nil {
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
 	// Use build-time context for scheduler to preserve builder-scoped logger.
 	// The scheduler uses context.WithoutCancel so cancellation is not inherited.
 	if err := m.scheduler.Start(m.buildCtx); err != nil {
+		stopErr := m.controller.Stop(context.Background())
+		if stopErr != nil {
+			return fmt.Errorf("%s: %w", opStart, errors.Join(err, stopErr))
+		}
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
 	return nil
@@ -905,27 +886,6 @@ func workspaceErrorFromRow(err *workspace.Error) *WorkspaceError {
 		Message:    err.Message,
 		Phase:      err.Phase,
 		RecordedAt: err.RecordedAt,
-	}
-}
-
-func workspaceErrorToRow(err *WorkspaceError) *workspace.Error {
-	if err == nil {
-		return nil
-	}
-	return &workspace.Error{
-		Code:       err.Code,
-		Message:    err.Message,
-		Phase:      err.Phase,
-		RecordedAt: err.RecordedAt,
-	}
-}
-
-func newWorkspaceError(now time.Time, code, phase, message string) *WorkspaceError {
-	return &WorkspaceError{
-		Code:       code,
-		Message:    message,
-		Phase:      phase,
-		RecordedAt: now,
 	}
 }
 

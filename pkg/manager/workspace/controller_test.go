@@ -377,7 +377,7 @@ func TestControllerSubmit_RetriesTransientRepoWrites(t *testing.T) {
 		t.Fatalf("expected flaky repo")
 	}
 	if h.flaky.statusCalls < 3 {
-		t.Fatalf("UpdateStatus calls = %d, want >= 3 (initial + 2 retries)", h.flaky.statusCalls)
+		t.Fatalf("UpdateStatusCAS calls = %d, want >= 3 (initial + 2 retries)", h.flaky.statusCalls)
 	}
 }
 
@@ -488,6 +488,8 @@ type controllerHarnessOptions struct {
 	uninstallFn    func(context.Context, infraops.InfraOps) error
 	probeFn        func(context.Context, infraops.InfraOps) (agent.ProbeResult, error)
 	flakyRepo      bool
+	// sharedRepo, when set, is used as the backing store (e.g. with a scheduler sharing the same repo).
+	sharedRepo *MemoryRepository
 }
 
 type controllerHarness struct {
@@ -500,7 +502,7 @@ type controllerHarness struct {
 	pluginObj  plugin.StoredObject
 }
 
-// flakyRepo fails the first two UpdateStatus calls then delegates (exercises retryRepoWrite).
+// flakyRepo fails the first two UpdateStatusCAS calls then delegates (exercises retryRepoWrite).
 type flakyRepo struct {
 	*MemoryRepository
 	mu          sync.Mutex
@@ -508,6 +510,10 @@ type flakyRepo struct {
 }
 
 func (r *flakyRepo) UpdateStatus(ctx context.Context, id WorkspaceID, status Status, statusErr *Error, lastProbeAt time.Time) error {
+	return r.MemoryRepository.UpdateStatus(ctx, id, status, statusErr, lastProbeAt)
+}
+
+func (r *flakyRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
 	r.mu.Lock()
 	r.statusCalls++
 	n := r.statusCalls
@@ -515,7 +521,7 @@ func (r *flakyRepo) UpdateStatus(ctx context.Context, id WorkspaceID, status Sta
 	if n <= 2 {
 		return errors.New("transient")
 	}
-	return r.MemoryRepository.UpdateStatus(ctx, id, status, statusErr, lastProbeAt)
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
 }
 
 func newControllerHarness(t *testing.T, opts controllerHarnessOptions) *controllerHarness {
@@ -542,7 +548,10 @@ func newControllerHarness(t *testing.T, opts controllerHarnessOptions) *controll
 	storage := plugin.NewMemoryStorage()
 	obj := seedPluginZip(t, storage, plugin.PluginID("plg_1"), "demo-plugin")
 
-	baseRepo := NewMemoryRepository()
+	baseRepo := opts.sharedRepo
+	if baseRepo == nil {
+		baseRepo = NewMemoryRepository()
+	}
 	var repo Repository = baseRepo
 	var flaky *flakyRepo
 	if opts.flakyRepo {
@@ -855,6 +864,179 @@ func TestAttachPlugins_RejectsBatchLayoutDirectoryCollision(t *testing.T) {
 	state.mu.Unlock()
 	if nFiles != 0 {
 		t.Fatalf("infra files written = %d, want 0 (preflight should fail before Apply)", nFiles)
+	}
+}
+
+func TestController_DoesNotPromoteFailedToHealthyAfterInitTimeoutRace(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+
+	h := newControllerHarness(t, controllerHarnessOptions{
+		sharedRepo:     repo,
+		installTimeout: time.Hour,
+		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	defer h.stop(t)
+
+	specSet := agent.NewSpecSet()
+	schedSpec := &fakeAgentSpec{layout: &fakePluginLayout{}}
+	if err := specSet.Register(schedSpec); err != nil {
+		t.Fatalf("Register(spec) error = %v", err)
+	}
+	schedRegistry := newFakeInfraRegistry()
+	schedFactories := infraops.NewFactorySet()
+	if err := schedFactories.Register(infraops.InfraType("localdir"), schedRegistry.factory()); err != nil {
+		t.Fatalf("Register(factory) error = %v", err)
+	}
+	scheduler, err := NewProbeScheduler(ProbeSchedulerConfig{
+		Repo:           repo,
+		AgentSpecs:     specSet,
+		Factories:      schedFactories,
+		Clock:          func() time.Time { return now },
+		InstallTimeout: 30 * time.Second,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewProbeScheduler() error = %v", err)
+	}
+
+	row := h.insertWorkspace(t, "wsp_init_race", "init-race", StatusInit)
+	cur, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	cur.CreatedAt = now.Add(-2 * time.Minute)
+	cur.UpdatedAt = now.Add(-2 * time.Minute)
+	if err := repo.Update(context.Background(), cur); err != nil {
+		t.Fatalf("Update() backdate CreatedAt: %v", err)
+	}
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("install did not start")
+	}
+
+	if err := scheduler.runTick(context.Background()); err != nil {
+		t.Fatalf("runTick() error = %v", err)
+	}
+
+	gotFailed, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() after watchdog error = %v", err)
+	}
+	if gotFailed.Status != StatusFailed {
+		t.Fatalf("status after watchdog = %q, want failed", gotFailed.Status)
+	}
+
+	close(release)
+	time.Sleep(400 * time.Millisecond)
+
+	final, err := repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() final error = %v", err)
+	}
+	if final.Status == StatusHealthy {
+		t.Fatalf("controller promoted failed -> healthy after watchdog; want failed")
+	}
+	if final.Status != StatusFailed {
+		t.Fatalf("final status = %q, want failed", final.Status)
+	}
+}
+
+func TestController_PersistAttachedPluginsPreservesConcurrentMetadataUpdate(t *testing.T) {
+	t.Parallel()
+
+	installStarted := make(chan struct{})
+	metaWritten := make(chan struct{})
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case installStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-metaWritten:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_meta", "meta-race", StatusInit)
+	go func() {
+		<-installStarted
+		cur, err := h.repo.Get(context.Background(), row.ID)
+		if err != nil {
+			t.Errorf("concurrent Get: %v", err)
+			close(metaWritten)
+			return
+		}
+		cur.Description = "concurrent-desc"
+		cur.Labels = map[string]string{"tier": "gold"}
+		if err := h.repo.Update(context.Background(), cur); err != nil {
+			t.Errorf("concurrent Update: %v", err)
+		}
+		close(metaWritten)
+	}()
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	got := waitForWorkspaceStatus(t, h.repo, row.ID, StatusHealthy, 2*time.Second)
+	if got.Description != "concurrent-desc" {
+		t.Fatalf("Description = %q, want concurrent-desc", got.Description)
+	}
+	if got.Labels == nil || got.Labels["tier"] != "gold" {
+		t.Fatalf("Labels = %#v, want tier=gold", got.Labels)
+	}
+	if len(got.Plugins) != 1 || len(got.Plugins[0].PlacedPaths) == 0 {
+		t.Fatalf("Plugins = %#v, want placed paths from install", got.Plugins)
+	}
+}
+
+func TestController_TransitionToFailed_UsesCASFromInitOnly(t *testing.T) {
+	t.Parallel()
+
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(context.Context, infraops.InfraOps, agent.InstallParams) error {
+			return errors.New("install boom")
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_cas_failed", "cas-failed", StatusInit)
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	waitForWorkspaceStatus(t, h.repo, row.ID, StatusFailed, time.Second)
+
+	err := h.repo.UpdateStatusCAS(context.Background(), row.ID, StatusWriterController, StatusInit, StatusFailed,
+		&Error{Code: "again", Message: "m", Phase: "install", RecordedAt: time.Now().UTC()}, time.Time{})
+	if !errors.Is(err, ErrStatusPreconditionFailed) {
+		t.Fatalf("second controller CAS from init error = %v, want ErrStatusPreconditionFailed", err)
 	}
 }
 

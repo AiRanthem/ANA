@@ -57,9 +57,12 @@ type ops struct {
 	requestLoopbackHost string
 	httpClient          *http.Client
 
-	mu          sync.RWMutex
+	mu          sync.Mutex
+	cond        *sync.Cond
 	initialized bool
 	cleared     bool
+	clearing    bool
+	activeOps   int
 	root        *os.Root
 
 	tmpCounter atomic.Uint64
@@ -87,14 +90,16 @@ func New(ctx context.Context, opts infraops.Options) (infraops.InfraOps, error) 
 		},
 	}
 
-	return &ops{
+	o := &ops{
 		dir:                 parsed.dir,
 		keepDir:             parsed.keepDir,
 		umask:               parsed.umask,
 		baseEnv:             slices.Clone(parsed.baseEnv),
 		requestLoopbackHost: parsed.requestLoopbackHost,
 		httpClient:          client,
-	}, nil
+	}
+	o.cond = sync.NewCond(&o.mu)
+	return o, nil
 }
 
 func parseOptions(ctx context.Context, opts infraops.Options) (options, error) {
@@ -338,12 +343,44 @@ func (o *ops) Dir() string {
 	return o.dir
 }
 
+func (o *ops) waitCondWithContextLocked(ctx context.Context, pred func() bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			o.mu.Lock()
+			o.cond.Broadcast()
+			o.mu.Unlock()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	for pred() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		o.cond.Wait()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (o *ops) Init(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	o.mu.Lock()
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	if o.cleared {
 		o.mu.Unlock()
 		return infraops.ErrCleared
@@ -395,7 +432,7 @@ func (o *ops) Init(ctx context.Context) error {
 		return fmt.Errorf("localdir init open root %q: %w", o.dir, err)
 	}
 
-	if err := o.setRoot(root); err != nil {
+	if err := o.setRoot(ctx, root); err != nil {
 		return err
 	}
 	return nil
@@ -407,6 +444,10 @@ func (o *ops) Open(ctx context.Context) error {
 	}
 
 	o.mu.Lock()
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	if o.cleared {
 		o.mu.Unlock()
 		return infraops.ErrCleared
@@ -435,13 +476,17 @@ func (o *ops) Open(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("localdir open root %q: %w", o.dir, err)
 	}
-	return o.setRoot(root)
+	return o.setRoot(ctx, root)
 }
 
-func (o *ops) setRoot(root *os.Root) error {
+func (o *ops) setRoot(ctx context.Context, root *os.Root) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
+		_ = root.Close()
+		return err
+	}
 	if o.cleared {
 		_ = root.Close()
 		return infraops.ErrCleared
@@ -464,10 +509,11 @@ func dirIsEmpty(dir string) (bool, error) {
 }
 
 func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.ExecResult, error) {
-	root, err := o.readyRoot()
+	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return infraops.ExecResult{}, err
 	}
+	defer release()
 
 	if strings.TrimSpace(cmd.Program) == "" {
 		return infraops.ExecResult{}, fmt.Errorf("%w: localdir exec program must not be empty", infraops.ErrInvalidOption)
@@ -567,9 +613,14 @@ func (o *ops) resolveWorkDir(root *os.Root, workDir string) (string, error) {
 }
 
 func (o *ops) PutFile(ctx context.Context, path string, content io.Reader, mode fs.FileMode) error {
-	root, err := o.readyRoot()
+	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return err
+	}
+	defer release()
+
+	if content == nil {
+		return fmt.Errorf("%w: localdir putfile content must not be nil", infraops.ErrInvalidOption)
 	}
 	cleanPath, err := sanitizeRelativePath(path)
 	if err != nil {
@@ -656,10 +707,11 @@ func (o *ops) tempSiblingPath(path string) string {
 }
 
 func (o *ops) GetFile(ctx context.Context, path string) (io.ReadCloser, error) {
-	root, err := o.readyRoot()
+	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	cleanPath, err := sanitizeRelativePath(path)
 	if err != nil {
 		return nil, err
@@ -690,9 +742,11 @@ func (o *ops) GetFile(ctx context.Context, path string) (io.ReadCloser, error) {
 }
 
 func (o *ops) Request(ctx context.Context, port int, req *http.Request) (*http.Response, error) {
-	if _, err := o.readyRoot(); err != nil {
+	_, release, err := o.beginOp(ctx)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if req == nil {
 		return nil, fmt.Errorf("%w: localdir request nil request", infraops.ErrInvalidOption)
 	}
@@ -721,53 +775,79 @@ func (o *ops) Clear(ctx context.Context) error {
 	}
 
 	o.mu.Lock()
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	if o.cleared {
 		o.mu.Unlock()
 		return nil
 	}
-	o.cleared = true
-	root := o.root
-	o.root = nil
-	o.initialized = false
+	o.clearing = true
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.activeOps > 0 }); err != nil {
+		o.clearing = false
+		o.cond.Broadcast()
+		o.mu.Unlock()
+		return err
+	}
+	currentRoot := o.root
 	o.mu.Unlock()
 
-	if root == nil {
+	var clearErr error
+	if currentRoot == nil {
 		pathInfo, err := os.Lstat(o.dir)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("localdir clear lstat dir %q: %w", o.dir, err)
-		}
-		if pathInfo.Mode()&fs.ModeSymlink != 0 {
-			if o.keepDir {
-				return nil
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			clearErr = nil
+		case err != nil:
+			clearErr = fmt.Errorf("localdir clear lstat dir %q: %w", o.dir, err)
+		default:
+			switch {
+			case pathInfo.Mode()&fs.ModeSymlink != 0:
+				if o.keepDir {
+					clearErr = nil
+				} else if removeErr := os.Remove(o.dir); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					clearErr = fmt.Errorf("localdir clear remove symlink %q: %w", o.dir, removeErr)
+				}
+			case !pathInfo.IsDir():
+				if o.keepDir {
+					clearErr = newInvalidDirError("dir is not a directory: %q", o.dir)
+				} else if removeErr := os.Remove(o.dir); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					clearErr = fmt.Errorf("localdir clear remove non-dir %q: %w", o.dir, removeErr)
+				}
+			default:
+				openedRoot, openErr := os.OpenRoot(o.dir)
+				if errors.Is(openErr, os.ErrNotExist) {
+					clearErr = nil
+				} else if openErr != nil {
+					clearErr = fmt.Errorf("localdir clear open root %q: %w", o.dir, openErr)
+				} else {
+					defer openedRoot.Close()
+					clearErr = o.clearRootHandle(ctx, openedRoot)
+				}
 			}
-			if err := os.Remove(o.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("localdir clear remove symlink %q: %w", o.dir, err)
-			}
-			return nil
 		}
-		if !pathInfo.IsDir() {
-			if o.keepDir {
-				return newInvalidDirError("dir is not a directory: %q", o.dir)
-			}
-			if err := os.Remove(o.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("localdir clear remove non-dir %q: %w", o.dir, err)
-			}
-			return nil
-		}
-		opened, err := os.OpenRoot(o.dir)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return fmt.Errorf("localdir clear open root %q: %w", o.dir, err)
-		}
-		root = opened
+	} else {
+		clearErr = o.clearRootHandle(ctx, currentRoot)
 	}
-	defer root.Close()
 
+	o.mu.Lock()
+	if clearErr == nil {
+		if o.root != nil {
+			_ = o.root.Close()
+		}
+		o.root = nil
+		o.initialized = false
+		o.cleared = true
+	}
+	o.clearing = false
+	o.cond.Broadcast()
+	o.mu.Unlock()
+
+	return clearErr
+}
+
+func (o *ops) clearRootHandle(ctx context.Context, root *os.Root) error {
 	rootInfo, statErr := root.Stat(".")
 	if statErr != nil {
 		return fmt.Errorf("localdir clear stat root %q: %w", o.dir, statErr)
@@ -828,16 +908,30 @@ func clearRootContents(ctx context.Context, root *os.Root) error {
 	return nil
 }
 
-func (o *ops) readyRoot() (*os.Root, error) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+func (o *ops) beginOp(ctx context.Context) (*os.Root, func(), error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
+		return nil, nil, err
+	}
 	if o.cleared {
-		return nil, infraops.ErrCleared
+		return nil, nil, infraops.ErrCleared
 	}
 	if !o.initialized || o.root == nil {
-		return nil, infraops.ErrNotInitialized
+		return nil, nil, infraops.ErrNotInitialized
 	}
-	return o.root, nil
+	o.activeOps++
+	root := o.root
+	release := func() {
+		o.mu.Lock()
+		o.activeOps--
+		if o.activeOps == 0 {
+			o.cond.Broadcast()
+		}
+		o.mu.Unlock()
+	}
+	return root, release, nil
 }
 
 func sanitizeRelativePath(path string) (string, error) {

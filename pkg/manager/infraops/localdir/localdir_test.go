@@ -283,6 +283,181 @@ func TestPutFileIsAtomicForReaders(t *testing.T) {
 	}
 }
 
+func TestClearWaitsForInFlightPutFile(t *testing.T) {
+	t.Parallel()
+
+	ops := initOpsInTempDir(t, nil)
+
+	reader := &gatedReader{
+		data:    bytes.Repeat([]byte("z"), 128*1024),
+		chunk:   1024,
+		started: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+
+	putErrCh := make(chan error, 1)
+	go func() {
+		putErrCh <- ops.PutFile(context.Background(), "inflight.bin", reader, 0o644)
+	}()
+
+	select {
+	case <-reader.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for PutFile to start")
+	}
+
+	clearCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	clearErrCh := make(chan error, 1)
+	go func() {
+		clearErrCh <- ops.Clear(clearCtx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(reader.allow)
+
+	select {
+	case err := <-putErrCh:
+		if err != nil {
+			t.Fatalf("PutFile failed while Clear in flight: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for PutFile result")
+	}
+
+	select {
+	case err := <-clearErrCh:
+		if err != nil {
+			t.Fatalf("Clear failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Clear result")
+	}
+
+	if err := ops.PutFile(context.Background(), "after-clear.txt", strings.NewReader("x"), 0o644); !errors.Is(err, infraops.ErrCleared) {
+		t.Fatalf("expected ErrCleared after clear, got %v", err)
+	}
+}
+
+func TestPutFileNilContentReturnsInvalidOption(t *testing.T) {
+	t.Parallel()
+	ops := initOpsInTempDir(t, nil)
+
+	err := ops.PutFile(context.Background(), "x.txt", nil, 0o644)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, infraops.ErrInvalidOption) {
+		t.Fatalf("expected ErrInvalidOption, got %v", err)
+	}
+}
+
+func TestClearReturnsContextErrorWhileWaitingForInflightOp(t *testing.T) {
+	t.Parallel()
+	ops := initOpsInTempDir(t, nil)
+
+	reader := &gatedReader{
+		data:    bytes.Repeat([]byte("z"), 128*1024),
+		chunk:   1024,
+		started: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+	putErrCh := make(chan error, 1)
+	go func() {
+		putErrCh <- ops.PutFile(context.Background(), "inflight.bin", reader, 0o644)
+	}()
+
+	<-reader.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	clearErrCh := make(chan error, 1)
+	go func() { clearErrCh <- ops.Clear(ctx) }()
+
+	err := <-clearErrCh
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context error, got %v", err)
+	}
+
+	close(reader.allow)
+	_ = <-putErrCh
+}
+
+func TestInitAndOpenReturnContextErrorWhileClearing(t *testing.T) {
+	t.Parallel()
+
+	ops := initOpsInTempDir(t, nil)
+	reader := &gatedReader{
+		data:    bytes.Repeat([]byte("a"), 64*1024),
+		chunk:   1024,
+		started: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+	putErrCh := make(chan error, 1)
+	go func() {
+		putErrCh <- ops.PutFile(context.Background(), "hold.bin", reader, 0o644)
+	}()
+	<-reader.started
+
+	clearErrCh := make(chan error, 1)
+	go func() { clearErrCh <- ops.Clear(context.Background()) }()
+
+	// Let Clear set clearing=true and block on activeOps before Init/Open run;
+	// otherwise they can observe clearing==false and return early (e.g. ErrAlreadyInitialized).
+	time.Sleep(50 * time.Millisecond)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	if err := ops.Init(ctx1); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Init expected context error, got %v", err)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	if err := ops.Open(ctx2); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open expected context error, got %v", err)
+	}
+
+	close(reader.allow)
+	_ = <-putErrCh
+	_ = <-clearErrCh
+}
+
+func TestOperationBeginOpReturnsContextErrorWhileClearing(t *testing.T) {
+	t.Parallel()
+
+	ops := initOpsInTempDir(t, nil)
+	reader := &gatedReader{
+		data:    bytes.Repeat([]byte("b"), 64*1024),
+		chunk:   1024,
+		started: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+	putErrCh := make(chan error, 1)
+	go func() {
+		putErrCh <- ops.PutFile(context.Background(), "hold2.bin", reader, 0o644)
+	}()
+	<-reader.started
+
+	clearErrCh := make(chan error, 1)
+	go func() { clearErrCh <- ops.Clear(context.Background()) }()
+
+	// Same ordering as TestInitAndOpenReturnContextErrorWhileClearing: ensure Clear holds clearing.
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := ops.PutFile(ctx, "during-clear.txt", strings.NewReader("y"), 0o644)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("PutFile expected context error, got %v", err)
+	}
+
+	close(reader.allow)
+	_ = <-putErrCh
+	_ = <-clearErrCh
+}
+
 func TestGetFileReadHonorsContextCancellation(t *testing.T) {
 	t.Parallel()
 
@@ -765,5 +940,41 @@ func (r *slowReader) Read(p []byte) (int, error) {
 	if r.sleep > 0 {
 		time.Sleep(r.sleep)
 	}
+	return n, nil
+}
+
+type gatedReader struct {
+	data    []byte
+	chunk   int
+	pos     int
+	started chan struct{}
+	allow   chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.chunk <= 0 {
+		r.chunk = 1024
+	}
+
+	r.once.Do(func() {
+		close(r.started)
+		<-r.allow
+	})
+
+	remain := len(r.data) - r.pos
+	n := r.chunk
+	if n > remain {
+		n = remain
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+
+	copy(p[:n], r.data[r.pos:r.pos+n])
+	r.pos += n
 	return n, nil
 }

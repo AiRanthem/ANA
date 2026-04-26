@@ -240,7 +240,15 @@ func (s *ProbeScheduler) runTick(ctx context.Context) error {
 		switch row.Status {
 		case StatusInit:
 			if s.installTimedOut(now, row) {
-				if err := s.repo.UpdateStatus(context.Background(), row.ID, StatusFailed, failureFromError(now, "install", ErrInstallTimeout), time.Time{}); err != nil {
+				if err := s.repo.UpdateStatusCAS(
+					context.Background(),
+					row.ID,
+					StatusWriterScheduler,
+					StatusInit,
+					StatusFailed,
+					failureFromError(now, "install", ErrInstallTimeout),
+					time.Time{},
+				); err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
 					logs.FromContext(ctx).Error("workspace init timeout transition failed",
 						"component", "workspace_scheduler",
 						"workspace_id", row.ID,
@@ -386,9 +394,21 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 	s.probesFailed.Add(1)
 }
 
+func (s *ProbeScheduler) transitionProbeStatus(row Workspace, next Status, statusErr *Error, probedAt time.Time) error {
+	return s.repo.UpdateStatusCAS(
+		context.Background(),
+		row.ID,
+		StatusWriterScheduler,
+		row.Status,
+		next,
+		statusErr,
+		probedAt,
+	)
+}
+
 func (s *ProbeScheduler) recordProbeOutcome(logCtx context.Context, row Workspace, newStatus Status, statusErr *Error, probedAt time.Time) {
 	if row.Status != newStatus {
-		if err := s.repo.UpdateStatus(context.Background(), row.ID, newStatus, statusErr, probedAt); err != nil {
+		if err := s.transitionProbeStatus(row, newStatus, statusErr, probedAt); err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
 			logs.FromContext(logCtx).Error("workspace probe transition failed",
 				"component", "workspace_scheduler",
 				"workspace_id", row.ID,
