@@ -81,16 +81,27 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: read %q: %v", ErrCorruptArchive, f.Name, err)
 		}
-		body, err := io.ReadAll(rc)
-		_ = rc.Close()
+		budget := maxExpanded - totalExpanded
+		if budget <= 0 {
+			_ = rc.Close()
+			return nil, fmt.Errorf("%w: expanded archive exceeds %d bytes", ErrCorruptArchive, maxExpanded)
+		}
+		// Cap bytes read per entry so a pathological member cannot allocate far beyond maxExpanded
+		// before the aggregate guard runs.
+		lr := io.LimitedReader{R: rc, N: budget + 1}
+		body, err := io.ReadAll(&lr)
+		closeErr := rc.Close()
 		if err != nil {
 			return nil, fmt.Errorf("%w: read %q: %v", ErrCorruptArchive, f.Name, err)
 		}
-
-		totalExpanded += int64(len(body))
-		if totalExpanded > maxExpanded {
+		if closeErr != nil {
+			return nil, fmt.Errorf("%w: read %q: close: %v", ErrCorruptArchive, f.Name, closeErr)
+		}
+		if int64(len(body)) > budget {
 			return nil, fmt.Errorf("%w: expanded archive exceeds %d bytes", ErrCorruptArchive, maxExpanded)
 		}
+
+		totalExpanded += int64(len(body))
 
 		if f.Name == manifestPathDefault {
 			manifestBytes = bytes.Clone(body)

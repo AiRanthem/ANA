@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -477,12 +476,6 @@ func (m *managerFacade) NewInfraOps(ctx context.Context, infraType InfraType, op
 	factory, ok := m.infraFactories.Get(infraops.InfraType(infraType))
 	if !ok {
 		return nil, fmt.Errorf("%s: %w: %q", opNewInfraOps, ErrInfraTypeUnknown, infraType)
-	}
-
-	rawDir, _ := options["dir"]
-	dir, _ := rawDir.(string)
-	if strings.TrimSpace(dir) == "" {
-		return nil, fmt.Errorf("%s: infra dir option must be non-empty: %w", opNewInfraOps, infraops.ErrInvalidOption)
 	}
 
 	ops, err := factory(ctx, cloneMapAny(options))

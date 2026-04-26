@@ -12,6 +12,24 @@ import (
 	"testing/fstest"
 )
 
+func TestOpenZipReader_RejectsEntryExceedingRemainingBudget(t *testing.T) {
+	t.Parallel()
+
+	zipBytes := buildZip(t, map[string][]byte{
+		"manifest.toml":      []byte(validManifest("p1", "skills/s1")),
+		"skills/s1/SKILL.md": bytes.Repeat([]byte("z"), 5000),
+	})
+	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		t.Fatalf("zip.NewReader: %v", err)
+	}
+	const maxExpanded = int64(2000)
+	_, err = openFromZip(zr, maxExpanded)
+	if !errors.Is(err, ErrCorruptArchive) {
+		t.Fatalf("openFromZip() error = %v, want %v", err, ErrCorruptArchive)
+	}
+}
+
 func TestOpenZipReader_RejectsInvalidArchives(t *testing.T) {
 	t.Parallel()
 

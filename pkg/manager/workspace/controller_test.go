@@ -249,6 +249,44 @@ func TestControllerDeleteWaitsForInFlightInstall(t *testing.T) {
 	}
 }
 
+func TestControllerDelete_ReturnsWhenWaitDeadlineExceeded(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(_ context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_del_deadline", "del-deadline", StatusInit)
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("install did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	err := h.controller.Delete(ctx, row.ID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Delete() error = %v, want context.DeadlineExceeded", err)
+	}
+
+	close(release)
+}
+
 func TestControllerStopCancelsInflightAndRejectsNewSubmit(t *testing.T) {
 	t.Parallel()
 

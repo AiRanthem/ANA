@@ -351,6 +351,18 @@ func (c *Controller) takeAndCancelQueuedInstalls(id WorkspaceID) context.CancelF
 }
 
 func (c *Controller) waitInstallIdle(ctx context.Context, id WorkspaceID) error {
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.mu.Lock()
+			c.queueCond.Broadcast()
+			c.mu.Unlock()
+		case <-stop:
+		}
+	}()
+	defer close(stop)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for c.installRunning[id] > 0 {
