@@ -168,15 +168,32 @@ func (s Spec) Probe(ctx context.Context, ops infraops.InfraOps) (agent.ProbeResu
 
 // ProtocolDescriptor returns the stable invocation descriptor for CLI bridge.
 func (s Spec) ProtocolDescriptor() agent.ProtocolDescriptor {
+	// Split the configured binary into command parts for the descriptor.
+	// The default "claude" becomes ["claude", "code"], but a custom binary
+	// (e.g., wrapper script or absolute path) is used verbatim as a single-element command.
+	command := s.invocationCommand()
 	return agent.ProtocolDescriptor{
 		Kind: agent.ProtocolKindCLI,
 		Detail: map[string]any{
-			"command":             []any{"claude", "code"},
+			"command":             command,
 			"resume_flag":         "--resume",
 			"cwd_relative_to_dir": "",
 			"stdin_input":         true,
 		},
 	}
+}
+
+// invocationCommand returns the command slice for ProtocolDescriptor.
+// The default "claude" binary requires ["claude", "code"], but custom binaries
+// (wrapper scripts, absolute paths) are used as a single-element command.
+func (s Spec) invocationCommand() []any {
+	binary := s.binaryName()
+	if binary == defaultBinary {
+		// Default: "claude code" invocation
+		return []any{defaultBinary, "code"}
+	}
+	// Custom binary: use verbatim (wrapper script, absolute path, etc.)
+	return []any{binary}
 }
 
 func (s Spec) execVersion(ctx context.Context, ops infraops.InfraOps, args []string) (string, error) {

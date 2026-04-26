@@ -224,6 +224,7 @@ func (b *Builder) Build(ctx context.Context) (Manager, error) {
 		infraFactories:      factories,
 		controller:          controller,
 		scheduler:           scheduler,
+		buildCtx:            ctx,
 	}, nil
 }
 
@@ -237,6 +238,7 @@ type managerFacade struct {
 	infraFactories      *infraops.FactorySet
 	controller          *workspace.Controller
 	scheduler           *workspace.ProbeScheduler
+	buildCtx            context.Context // Build-time context with attached logger
 
 	mu             sync.RWMutex
 	stopInProgress bool
@@ -559,10 +561,23 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 	}
 
 	if err := m.controller.Submit(context.Background(), row, params); err != nil {
-		statusErr := newWorkspaceError(m.clock(), "install.error", "install", err.Error())
 		if errors.Is(err, workspace.ErrControllerShutdown) {
-			statusErr = newWorkspaceError(m.clock(), "shutdown", "install", err.Error())
+			// Controller shutdown during enqueue: the caller was told the workspace was not created,
+			// so we must delete the inserted row to free the alias for retry.
+			if deleteErr := m.workspaceRepository.Delete(context.Background(), row.ID); deleteErr != nil {
+				logs.FromContext(ctx).Error("failed to delete workspace row after shutdown enqueue failure",
+					"op", opCreateWorkspace,
+					"component", "manager.workspace",
+					"workspace_id", row.ID,
+					"workspace_alias", row.Alias,
+					"namespace", row.Namespace,
+					"err", deleteErr,
+				)
+			}
+			return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
 		}
+		// Non-shutdown install failures: mark as failed so the workspace record persists.
+		statusErr := newWorkspaceError(m.clock(), "install.error", "install", err.Error())
 		if updateErr := m.workspaceRepository.UpdateStatus(context.Background(), row.ID, workspace.StatusFailed, workspaceErrorToRow(statusErr), time.Time{}); updateErr != nil {
 			logs.FromContext(ctx).Error("workspace submission failure transition failed",
 				"op", opCreateWorkspace,
@@ -675,7 +690,9 @@ func (m *managerFacade) Start(ctx context.Context) error {
 	if err := m.controller.Start(ctx); err != nil {
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
-	if err := m.scheduler.Start(ctx); err != nil {
+	// Use build-time context for scheduler to preserve builder-scoped logger.
+	// The scheduler uses context.WithoutCancel so cancellation is not inherited.
+	if err := m.scheduler.Start(m.buildCtx); err != nil {
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
 	return nil
