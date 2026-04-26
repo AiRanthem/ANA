@@ -458,12 +458,14 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 
 	probeCtx, probeCancel := context.WithTimeout(installCtx, c.probeTimeout)
 	result, err := spec.Probe(probeCtx, ops)
-	probeCancel()
 	probedAt := c.clock()
 	if err != nil {
-		c.transitionToFailed(persistCtx, probeCtx, job.workspace.ID, c.classifyFailure(probeCtx, "probe", err), probedAt)
+		failure := c.classifyFailure(probeCtx, "probe", err)
+		probeCancel()
+		c.transitionToFailed(persistCtx, probeCtx, job.workspace.ID, failure, probedAt)
 		return
 	}
+	probeCancel()
 	if !result.Healthy {
 		c.transitionToFailed(persistCtx, probeCtx, job.workspace.ID, failureFromProbeResult(c.clock(), result), probedAt)
 		return

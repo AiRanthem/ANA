@@ -396,8 +396,11 @@ ErrWorkspaceNotFound without side effects.
 User → Manager.DeletePlugin(plugin_id)
 
 1. PluginRepository.Get(plugin_id) → Plugin or ErrPluginNotFound.
-2. PluginStorage.Delete(plugin_id) → removes the zip from the backend.
-3. PluginRepository.Delete(plugin_id) → removes the metadata row.
+2. PluginRepository.Delete(plugin_id) → removes the metadata row first so
+   callers never see a row whose blob is already gone if storage delete fails.
+3. PluginStorage.Delete(plugin_id) → removes the zip from the backend.
+   A failed storage delete after a successful metadata delete leaves an orphan
+   blob, which is preferable to queryable metadata without bytes.
 
 Workspaces that previously attached this plugin keep their on-disk
 plugin files (the manager does not enforce referential integrity at
