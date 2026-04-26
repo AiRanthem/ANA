@@ -99,7 +99,6 @@ type Controller struct {
     AgentSpecs    *agent.SpecSet
     Factories     *infraops.FactorySet
     Clock         func() time.Time
-    Logger        *slog.Logger
 
     // tuning
     InstallTimeout time.Duration // default 10 min
@@ -200,7 +199,6 @@ type ProbeScheduler struct {
     AgentSpecs *agent.SpecSet
     Factories  *infraops.FactorySet
     Clock      func() time.Time
-    Logger     *slog.Logger
 
     Interval        time.Duration // default 30s
     Workers         int           // default 4
@@ -241,7 +239,7 @@ Every `Interval`:
 - Workers across ticks may overlap if a tick takes longer than
   `Interval`. The scheduler drops a tick rather than running two in
   parallel: when the previous tick is still active at tick time,
-  log `slog.Warn(probe_overrun)` and skip.
+  log `logs.FromContext(ctx).Warn("probe_overrun", …)` and skip.
 
 ### Stats
 

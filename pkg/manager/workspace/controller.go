@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/AiRanthem/ANA/pkg/logs"
 	"github.com/AiRanthem/ANA/pkg/manager/agent"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 	"github.com/AiRanthem/ANA/pkg/manager/plugin"
@@ -32,7 +31,6 @@ type ControllerConfig struct {
 	AgentSpecs    *agent.SpecSet
 	Factories     *infraops.FactorySet
 	Clock         func() time.Time
-	Logger        *slog.Logger
 
 	InstallTimeout time.Duration
 	InstallWorkers int
@@ -47,7 +45,6 @@ type Controller struct {
 	agentSpecs    *agent.SpecSet
 	factories     *infraops.FactorySet
 	clock         func() time.Time
-	logger        *slog.Logger
 
 	installTimeout time.Duration
 	installWorkers int
@@ -89,9 +86,6 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 	if cfg.Clock == nil {
 		cfg.Clock = func() time.Time { return time.Now().UTC() }
 	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
 	if cfg.InstallTimeout <= 0 {
 		cfg.InstallTimeout = defaultInstallTimeout
 	}
@@ -111,7 +105,6 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 		agentSpecs:     cfg.AgentSpecs,
 		factories:      cfg.Factories,
 		clock:          cfg.Clock,
-		logger:         cfg.Logger,
 		installTimeout: cfg.InstallTimeout,
 		installWorkers: cfg.InstallWorkers,
 		maxPluginSize:  cfg.MaxPluginSize,
@@ -122,7 +115,13 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 }
 
 // Start launches the install worker pool.
-func (c *Controller) Start(_ context.Context) error {
+//
+// Logging uses [logs.FromContext] on contexts derived from ctx. Callers
+// should attach a logger with [logs.IntoContext] on ctx before Start
+// (the manager wires this at build time). Parent cancellation is not
+// inherited: the install root uses [context.WithoutCancel] so only
+// [Controller.Stop] cancels workers.
+func (c *Controller) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -133,7 +132,12 @@ func (c *Controller) Start(_ context.Context) error {
 		return nil
 	}
 
-	c.installCtx, c.cancel = context.WithCancel(context.Background())
+	parent := ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	root := context.WithoutCancel(parent)
+	c.installCtx, c.cancel = context.WithCancel(root)
 	c.workersDone = make(chan struct{})
 	c.workersRemaining.Store(int64(c.installWorkers))
 	c.started = true
@@ -224,7 +228,7 @@ func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 	}
 
 	if err := ops.Open(ctx); err != nil {
-		c.logger.Warn("workspace open before uninstall failed",
+		logs.FromContext(ctx).Warn("workspace open before uninstall failed",
 			"component", "workspace_controller",
 			"workspace_id", row.ID,
 			"workspace_alias", row.Alias,
@@ -235,7 +239,7 @@ func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 			"err", err,
 		)
 	} else if err := spec.Uninstall(ctx, ops); err != nil {
-		c.logger.Warn("workspace uninstall failed",
+		logs.FromContext(ctx).Warn("workspace uninstall failed",
 			"component", "workspace_controller",
 			"workspace_id", row.ID,
 			"workspace_alias", row.Alias,
@@ -247,7 +251,7 @@ func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 		)
 	}
 	if err := ops.Clear(ctx); err != nil {
-		c.logger.Warn("workspace clear failed",
+		logs.FromContext(ctx).Warn("workspace clear failed",
 			"component", "workspace_controller",
 			"workspace_id", row.ID,
 			"workspace_alias", row.Alias,
@@ -307,7 +311,7 @@ func (c *Controller) runInstall(job installJob) {
 	persistCtx := context.Background()
 
 	if err := c.installCtx.Err(); err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, failureForShutdown(c.clock()), time.Time{})
+		c.transitionToFailed(persistCtx, c.installCtx, job.workspace.ID, failureForShutdown(c.clock()), time.Time{})
 		return
 	}
 
@@ -316,35 +320,35 @@ func (c *Controller) runInstall(job installJob) {
 
 	factory, ok := c.factories.Get(infraops.InfraType(job.workspace.InfraType))
 	if !ok {
-		c.transitionToFailed(persistCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, job.workspace.InfraType)), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, job.workspace.InfraType)), time.Time{})
 		return
 	}
 
 	ops, err := factory(installCtx, job.workspace.InfraOptions)
 	if err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
 		return
 	}
 
 	if err := ops.Init(installCtx); err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
 		return
 	}
 
 	spec, ok := c.agentSpecs.Get(agent.AgentType(job.workspace.AgentType))
 	if !ok {
-		c.transitionToFailed(persistCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, job.workspace.AgentType)), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, job.workspace.AgentType)), time.Time{})
 		return
 	}
 
 	attachedPlugins, err := c.attachPlugins(installCtx, ops, spec, job.workspace.Plugins)
 	if err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
 		return
 	}
 
 	if err := spec.Install(installCtx, ops, job.params); err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, c.classifyFailure(installCtx, "install", err), time.Time{})
 		return
 	}
 
@@ -353,28 +357,28 @@ func (c *Controller) runInstall(job installJob) {
 	probeCancel()
 	probedAt := c.clock()
 	if err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, c.classifyFailure(probeCtx, "probe", err), probedAt)
+		c.transitionToFailed(persistCtx, probeCtx, job.workspace.ID, c.classifyFailure(probeCtx, "probe", err), probedAt)
 		return
 	}
 	if !result.Healthy {
-		c.transitionToFailed(persistCtx, job.workspace.ID, failureFromProbeResult(c.clock(), result), probedAt)
+		c.transitionToFailed(persistCtx, probeCtx, job.workspace.ID, failureFromProbeResult(c.clock(), result), probedAt)
 		return
 	}
 
 	updated := cloneWorkspace(job.workspace)
 	updated.Plugins = attachedPlugins
 	updated.UpdatedAt = c.clock()
-	if err := c.retryRepoWrite(persistCtx, "persist_attached_plugins", func(ctx context.Context) error {
+	if err := c.retryRepoWrite(persistCtx, installCtx, "persist_attached_plugins", func(ctx context.Context) error {
 		return c.repo.Update(ctx, updated)
 	}); err != nil {
-		c.transitionToFailed(persistCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("persist attached plugins: %w", err)), time.Time{})
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID, failureFromError(c.clock(), "install", fmt.Errorf("persist attached plugins: %w", err)), time.Time{})
 		return
 	}
 
-	if err := c.retryRepoWrite(persistCtx, "update_status_healthy", func(ctx context.Context) error {
+	if err := c.retryRepoWrite(persistCtx, installCtx, "update_status_healthy", func(ctx context.Context) error {
 		return c.repo.UpdateStatus(ctx, updated.ID, StatusHealthy, nil, probedAt)
 	}); err != nil {
-		c.logger.Error("workspace healthy transition failed",
+		logs.FromContext(installCtx).Error("workspace healthy transition failed",
 			"component", "workspace_controller",
 			"workspace_id", updated.ID,
 			"workspace_alias", updated.Alias,
@@ -438,11 +442,14 @@ func (c *Controller) attachPlugins(ctx context.Context, ops infraops.InfraOps, s
 	return attached, nil
 }
 
-func (c *Controller) transitionToFailed(ctx context.Context, id WorkspaceID, statusErr *Error, lastProbeAt time.Time) {
-	if err := c.retryRepoWrite(ctx, "update_status_failed", func(ctx context.Context) error {
+func (c *Controller) transitionToFailed(repoCtx, logCtx context.Context, id WorkspaceID, statusErr *Error, lastProbeAt time.Time) {
+	if logCtx == nil {
+		logCtx = repoCtx
+	}
+	if err := c.retryRepoWrite(repoCtx, logCtx, "update_status_failed", func(ctx context.Context) error {
 		return c.repo.UpdateStatus(ctx, id, StatusFailed, statusErr, lastProbeAt)
 	}); err != nil {
-		c.logger.Error("workspace failed transition failed",
+		logs.FromContext(logCtx).Error("workspace failed transition failed",
 			"component", "workspace_controller",
 			"workspace_id", id,
 			"phase", "status",
@@ -451,13 +458,16 @@ func (c *Controller) transitionToFailed(ctx context.Context, id WorkspaceID, sta
 	}
 }
 
-func (c *Controller) retryRepoWrite(ctx context.Context, op string, fn func(context.Context) error) error {
-	err := fn(ctx)
+func (c *Controller) retryRepoWrite(repoCtx, logCtx context.Context, op string, fn func(context.Context) error) error {
+	if logCtx == nil {
+		logCtx = repoCtx
+	}
+	err := fn(repoCtx)
 	if err == nil {
 		return nil
 	}
 	for _, delay := range repoRetryBackoff {
-		c.logger.Warn("workspace repo write retry",
+		logs.FromContext(logCtx).Warn("workspace repo write retry",
 			"component", "workspace_controller",
 			"op", op,
 			"delay_ms", delay.Milliseconds(),
@@ -465,10 +475,10 @@ func (c *Controller) retryRepoWrite(ctx context.Context, op string, fn func(cont
 		)
 		select {
 		case <-time.After(delay):
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-repoCtx.Done():
+			return repoCtx.Err()
 		}
-		err = fn(ctx)
+		err = fn(repoCtx)
 		if err == nil {
 			return nil
 		}

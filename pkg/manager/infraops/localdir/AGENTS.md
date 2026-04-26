@@ -24,8 +24,6 @@ for `Request`. CLI is a leaf in the dependency graph.
 
 ## Don'ts
 
-- Do not import any other manager subpackage. `localdir` only
-  imports `infraops` and the standard library.
 - Do not call `os.Chdir`. The manager process may be running other
   workspaces concurrently; `Chdir` would leak state.
 - Do not retry `Exec` internally. The manager controls retries (and

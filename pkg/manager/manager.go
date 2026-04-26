@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AiRanthem/ANA/pkg/logs"
 	"github.com/AiRanthem/ANA/pkg/manager/agent"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 	"github.com/AiRanthem/ANA/pkg/manager/plugin"
@@ -69,7 +70,7 @@ type Builder struct {
 
 	Clock       func() time.Time
 	IDGenerator IDGenerator
-	Logger      *slog.Logger
+	Logger      logs.Logger
 
 	InstallTimeout time.Duration
 	InstallWorkers int
@@ -115,7 +116,7 @@ func (b *Builder) RegisterInfraType(infraType InfraType, factory infraops.Factor
 }
 
 // Build validates the wiring and constructs a manager instance.
-func (b *Builder) Build() (Manager, error) {
+func (b *Builder) Build(ctx context.Context) (Manager, error) {
 	if b == nil {
 		return nil, fmt.Errorf("%s: nil builder", opBuild)
 	}
@@ -134,6 +135,10 @@ func (b *Builder) Build() (Manager, error) {
 		return nil, fmt.Errorf("%s: nil workspace repository", opBuild)
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	clock := b.Clock
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
@@ -144,8 +149,9 @@ func (b *Builder) Build() (Manager, error) {
 	}
 	logger := b.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		logger = logs.NewSlog(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}
+	ctx = logs.IntoContext(ctx, logger)
 
 	specs := agent.NewSpecSet()
 	for _, spec := range b.agentSpecs {
@@ -165,13 +171,13 @@ func (b *Builder) Build() (Manager, error) {
 	}
 
 	if specs.Len() == 0 {
-		logger.Warn("manager built with no registered agent specs",
+		logs.FromContext(ctx).Warn("manager built with no registered agent specs",
 			"op", opBuild,
 			"component", "manager",
 		)
 	}
 	if len(factories.Types()) == 0 {
-		logger.Warn("manager built with no registered infra factories",
+		logs.FromContext(ctx).Warn("manager built with no registered infra factories",
 			"op", opBuild,
 			"component", "manager",
 		)
@@ -183,7 +189,6 @@ func (b *Builder) Build() (Manager, error) {
 		AgentSpecs:     specs,
 		Factories:      factories,
 		Clock:          clock,
-		Logger:         logger,
 		InstallTimeout: b.InstallTimeout,
 		InstallWorkers: b.InstallWorkers,
 		ProbeTimeout:   b.ProbeTimeout,
@@ -191,7 +196,7 @@ func (b *Builder) Build() (Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", opBuild, err)
 	}
-	if err := controller.Start(context.Background()); err != nil {
+	if err := controller.Start(ctx); err != nil {
 		return nil, fmt.Errorf("%s: %w", opBuild, err)
 	}
 
@@ -200,14 +205,13 @@ func (b *Builder) Build() (Manager, error) {
 		AgentSpecs:     specs,
 		Factories:      factories,
 		Clock:          clock,
-		Logger:         logger,
 		Interval:       b.ProbeInterval,
 		Workers:        b.ProbeWorkers,
 		Timeout:        b.ProbeTimeout,
 		InstallTimeout: b.InstallTimeout,
 	})
 	if err != nil {
-		_ = controller.Stop(context.Background())
+		_ = controller.Stop(ctx)
 		return nil, fmt.Errorf("%s: %w", opBuild, err)
 	}
 
@@ -217,7 +221,6 @@ func (b *Builder) Build() (Manager, error) {
 		workspaceRepository: b.WorkspaceRepository,
 		clock:               clock,
 		idGenerator:         idGenerator,
-		logger:              logger,
 		agentSpecs:          specs,
 		infraFactories:      factories,
 		controller:          controller,
@@ -231,7 +234,6 @@ type managerFacade struct {
 	workspaceRepository workspace.Repository
 	clock               func() time.Time
 	idGenerator         IDGenerator
-	logger              *slog.Logger
 	agentSpecs          *agent.SpecSet
 	infraFactories      *infraops.FactorySet
 	controller          *workspace.Controller
@@ -340,7 +342,7 @@ func (m *managerFacade) CreatePlugin(ctx context.Context, req CreatePluginReques
 		if err := m.pluginRepository.Update(ctx, row); err != nil {
 			rollbackErr := m.restorePluginBlob(context.Background(), row.ID, oldBody)
 			if rollbackErr != nil {
-				m.logger.Error("plugin overwrite rollback failed",
+				logs.FromContext(ctx).Error("plugin overwrite rollback failed",
 					"op", opCreatePlugin,
 					"component", "manager.plugin",
 					"plugin_id", row.ID,
@@ -353,7 +355,7 @@ func (m *managerFacade) CreatePlugin(ctx context.Context, req CreatePluginReques
 	} else {
 		if err := m.pluginRepository.Insert(ctx, row); err != nil {
 			if deleteErr := m.pluginStorage.Delete(context.Background(), row.ID); deleteErr != nil {
-				m.logger.Warn("plugin upload cleanup failed",
+				logs.FromContext(ctx).Warn("plugin upload cleanup failed",
 					"op", opCreatePlugin,
 					"component", "manager.plugin",
 					"plugin_id", row.ID,
@@ -568,7 +570,7 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 			statusErr = newWorkspaceError(m.clock(), "shutdown", "install", err.Error())
 		}
 		if updateErr := m.workspaceRepository.UpdateStatus(context.Background(), row.ID, workspace.StatusFailed, workspaceErrorToRow(statusErr), time.Time{}); updateErr != nil {
-			m.logger.Error("workspace submission failure transition failed",
+			logs.FromContext(ctx).Error("workspace submission failure transition failed",
 				"op", opCreateWorkspace,
 				"component", "manager.workspace",
 				"workspace_id", row.ID,
@@ -705,9 +707,9 @@ func (m *managerFacade) Stop(ctx context.Context) error {
 		return fmt.Errorf("%s: %w", opStop, err)
 	}
 
-	m.closeQuietly(opStop, m.workspaceRepository.Close)
-	m.closeQuietly(opStop, m.pluginRepository.Close)
-	m.closeQuietly(opStop, m.pluginStorage.Close)
+	m.closeQuietly(ctx, opStop, m.workspaceRepository.Close)
+	m.closeQuietly(ctx, opStop, m.pluginRepository.Close)
+	m.closeQuietly(ctx, opStop, m.pluginStorage.Close)
 	return nil
 }
 
@@ -755,12 +757,12 @@ func (m *managerFacade) ensureAvailable(op string) error {
 	return nil
 }
 
-func (m *managerFacade) closeQuietly(op string, closeFn func(context.Context) error) {
+func (m *managerFacade) closeQuietly(ctx context.Context, op string, closeFn func(context.Context) error) {
 	if closeFn == nil {
 		return
 	}
 	if err := closeFn(context.Background()); err != nil {
-		m.logger.Warn("manager close failed",
+		logs.FromContext(ctx).Warn("manager close failed",
 			"op", op,
 			"component", "manager",
 			"err", err,

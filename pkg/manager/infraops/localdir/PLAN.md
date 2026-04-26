@@ -39,8 +39,8 @@ Validation:
   `ErrInvalidDir` otherwise.
 - `dir` MUST resolve outside reserved system locations (`/`, `/etc`,
   `/usr`, `/bin`, `/sbin`, `/var/log`, `$HOME`-relative parents). The
-  v1 reference checks against a hard-coded deny list with `slog.Warn`
-  on overlap; operators that need other paths replace the validator
+  v1 reference checks against a hard-coded deny list with
+  `logs.FromContext(ctx).Warn` on overlap; operators that need other paths replace the validator
   via a future `Options["allow_path"]` knob (out of v1).
 - `keep_dir`, when `true`, instructs `Clear` to remove the directory's
   contents but leave the directory itself in place (useful when an
@@ -95,7 +95,7 @@ device/inode as the opened root (so a replaced path is not followed).
    `cmd.Env`.
 4. Wire `Stdin` if provided; wire `Stdout`/`Stderr` to either the
    caller's writer or a `bytes.Buffer` capped at 8 MiB per stream
-   (oversized output emits a `slog.Warn` and truncates).
+   (oversized output emits `logs.FromContext(ctx).Warn` and truncates).
 5. `Run` and translate `*exec.ExitError` → `ExitCode` field. Other
    errors (program not found, IO failure) bubble up.
 6. Record `Duration`.

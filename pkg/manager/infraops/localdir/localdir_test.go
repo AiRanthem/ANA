@@ -79,7 +79,7 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := New(tt.opts)
+			_, err := New(context.Background(), tt.opts)
 			if err == nil {
 				t.Fatalf("expected error")
 			}
@@ -540,7 +540,7 @@ func TestNewRejectsNonLoopbackRequestHost(t *testing.T) {
 		tt := tt
 		t.Run(tt.host, func(t *testing.T) {
 			t.Parallel()
-			_, err := New(infraops.Options{"dir": dir, "request_loopback_host": tt.host})
+			_, err := New(context.Background(), infraops.Options{"dir": dir, "request_loopback_host": tt.host})
 			if tt.wantErr {
 				if err == nil || !errors.Is(err, infraops.ErrInvalidOption) {
 					t.Fatalf("New() error = %v, want ErrInvalidOption", err)
@@ -702,7 +702,7 @@ func TestMixedWorkloadConcurrency(t *testing.T) {
 func mustNewOps(t *testing.T, opts infraops.Options) infraops.InfraOps {
 	t.Helper()
 
-	got, err := New(opts)
+	got, err := New(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("new localdir: %v", err)
 	}

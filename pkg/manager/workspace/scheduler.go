@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/AiRanthem/ANA/pkg/logs"
 	"github.com/AiRanthem/ANA/pkg/manager/agent"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 )
@@ -27,7 +26,6 @@ type ProbeSchedulerConfig struct {
 	AgentSpecs *agent.SpecSet
 	Factories  *infraops.FactorySet
 	Clock      func() time.Time
-	Logger     *slog.Logger
 
 	Interval       time.Duration
 	Workers        int
@@ -50,7 +48,6 @@ type ProbeScheduler struct {
 	agentSpecs *agent.SpecSet
 	factories  *infraops.FactorySet
 	clock      func() time.Time
-	logger     *slog.Logger
 
 	interval       time.Duration
 	workers        int
@@ -85,9 +82,6 @@ func NewProbeScheduler(cfg ProbeSchedulerConfig) (*ProbeScheduler, error) {
 	if cfg.Clock == nil {
 		cfg.Clock = func() time.Time { return time.Now().UTC() }
 	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultProbeInterval
 	}
@@ -106,7 +100,6 @@ func NewProbeScheduler(cfg ProbeSchedulerConfig) (*ProbeScheduler, error) {
 		agentSpecs:     cfg.AgentSpecs,
 		factories:      cfg.Factories,
 		clock:          cfg.Clock,
-		logger:         cfg.Logger,
 		interval:       cfg.Interval,
 		workers:        cfg.Workers,
 		timeout:        cfg.Timeout,
@@ -115,7 +108,12 @@ func NewProbeScheduler(cfg ProbeSchedulerConfig) (*ProbeScheduler, error) {
 }
 
 // Start launches the periodic scheduler loop.
-func (s *ProbeScheduler) Start(_ context.Context) error {
+//
+// Logging uses [logs.FromContext] on contexts derived from ctx. Callers
+// should attach a logger with [logs.IntoContext] on ctx before Start.
+// Parent cancellation is not inherited ([context.WithoutCancel]); only
+// [ProbeScheduler.Stop] cancels the loop.
+func (s *ProbeScheduler) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -126,7 +124,12 @@ func (s *ProbeScheduler) Start(_ context.Context) error {
 		return nil
 	}
 
-	s.runCtx, s.cancel = context.WithCancel(context.Background())
+	parent := ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	root := context.WithoutCancel(parent)
+	s.runCtx, s.cancel = context.WithCancel(root)
 	s.loopDone = make(chan struct{})
 	s.started = true
 	go s.loop()
@@ -184,7 +187,7 @@ func (s *ProbeScheduler) loop() {
 			return
 		case <-ticker.C:
 			if err := s.runTick(s.runCtx); err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.Error("workspace probe tick failed",
+				logs.FromContext(s.runCtx).Error("workspace probe tick failed",
 					"component", "workspace_scheduler",
 					"err", err,
 				)
@@ -193,7 +196,7 @@ func (s *ProbeScheduler) loop() {
 			select {
 			case <-ticker.C:
 				s.overruns.Add(1)
-				s.logger.Warn("probe_overrun",
+				logs.FromContext(s.runCtx).Warn("probe_overrun",
 					"component", "workspace_scheduler",
 					"interval", s.interval.String(),
 				)
@@ -225,7 +228,7 @@ func (s *ProbeScheduler) runTick(ctx context.Context) error {
 		case StatusInit:
 			if s.installTimedOut(now, row) {
 				if err := s.repo.UpdateStatus(context.Background(), row.ID, StatusFailed, failureFromError(now, "install", ErrInstallTimeout), time.Time{}); err != nil {
-					s.logger.Error("workspace init timeout transition failed",
+					logs.FromContext(ctx).Error("workspace init timeout transition failed",
 						"component", "workspace_scheduler",
 						"workspace_id", row.ID,
 						"phase", "status",
@@ -312,7 +315,7 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 
 	factory, ok := s.factories.Get(infraops.InfraType(row.InfraType))
 	if !ok {
-		s.recordProbeOutcome(row, StatusFailed, failureFromError(s.clock(), "probe", fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, row.InfraType)), s.clock())
+		s.recordProbeOutcome(ctx, row, StatusFailed, failureFromError(s.clock(), "probe", fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, row.InfraType)), s.clock())
 		s.probesFailed.Add(1)
 		return
 	}
@@ -325,7 +328,7 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 		if probeCtx.Err() != nil && ctx.Err() != nil {
 			return
 		}
-		s.recordProbeOutcome(row, StatusFailed, failureFromError(s.clock(), "probe", err), s.clock())
+		s.recordProbeOutcome(ctx, row, StatusFailed, failureFromError(s.clock(), "probe", err), s.clock())
 		s.probesFailed.Add(1)
 		return
 	}
@@ -333,14 +336,14 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 		if probeCtx.Err() != nil && ctx.Err() != nil {
 			return
 		}
-		s.recordProbeOutcome(row, StatusFailed, failureFromError(s.clock(), "probe", err), s.clock())
+		s.recordProbeOutcome(ctx, row, StatusFailed, failureFromError(s.clock(), "probe", err), s.clock())
 		s.probesFailed.Add(1)
 		return
 	}
 
 	spec, ok := s.agentSpecs.Get(agent.AgentType(row.AgentType))
 	if !ok {
-		s.recordProbeOutcome(row, StatusFailed, failureFromError(s.clock(), "probe", fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, row.AgentType)), s.clock())
+		s.recordProbeOutcome(ctx, row, StatusFailed, failureFromError(s.clock(), "probe", fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, row.AgentType)), s.clock())
 		s.probesFailed.Add(1)
 		return
 	}
@@ -355,7 +358,7 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 	}
 
 	if err == nil && result.Healthy {
-		s.recordProbeOutcome(row, StatusHealthy, nil, probedAt)
+		s.recordProbeOutcome(ctx, row, StatusHealthy, nil, probedAt)
 		s.probesHealthy.Add(1)
 		return
 	}
@@ -366,14 +369,14 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 	} else {
 		statusErr = failureFromProbeResult(s.clock(), result)
 	}
-	s.recordProbeOutcome(row, StatusFailed, statusErr, probedAt)
+	s.recordProbeOutcome(ctx, row, StatusFailed, statusErr, probedAt)
 	s.probesFailed.Add(1)
 }
 
-func (s *ProbeScheduler) recordProbeOutcome(row Workspace, newStatus Status, statusErr *Error, probedAt time.Time) {
+func (s *ProbeScheduler) recordProbeOutcome(logCtx context.Context, row Workspace, newStatus Status, statusErr *Error, probedAt time.Time) {
 	if row.Status != newStatus {
 		if err := s.repo.UpdateStatus(context.Background(), row.ID, newStatus, statusErr, probedAt); err != nil {
-			s.logger.Error("workspace probe transition failed",
+			logs.FromContext(logCtx).Error("workspace probe transition failed",
 				"component", "workspace_scheduler",
 				"workspace_id", row.ID,
 				"phase", "status",
@@ -392,7 +395,7 @@ func (s *ProbeScheduler) recordProbeOutcome(row Workspace, newStatus Status, sta
 		updated.StatusError = cloneError(statusErr)
 	}
 	if err := s.repo.Update(context.Background(), updated); err != nil {
-		s.logger.Error("workspace probe metadata update failed",
+		logs.FromContext(logCtx).Error("workspace probe metadata update failed",
 			"component", "workspace_scheduler",
 			"workspace_id", row.ID,
 			"phase", "update",

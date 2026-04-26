@@ -79,8 +79,9 @@ plugin.zip
 
 Reserved names at zip root: `manifest.toml`, `README.md`, `AGENTS.md`,
 `skills/`, `rules/`, `hooks/`, `subagents/`, `mcps/`, `assets/`. All
-other names at the root are passed through but emit a `slog` warning
-during ingest.
+other names at the root are passed through but emit a structured
+warning via `pkg/logs` (same `logs.FromContext` conventions as the rest
+of the repo) during ingest.
 
 ### File-level rules
 

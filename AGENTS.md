@@ -23,7 +23,9 @@
 - Do not use `panic` for normal control flow; reserve it for unrecoverable programmer errors.
 
 ## Logging
-- Default to the standard library `log/slog` for structured logging; only introduce another logger if there is a concrete reason.
+- Use the repository `pkg/logs` package and its `Logger` API for structured logging.
+- For any code path that already has a `context.Context`, obtain the logger with **`logs.FromContext(ctx)`** and call `Debug` / `Info` / `Warn` / `Error` on that value. Use **`logs.IntoContext`** (or `logs.NewContext`) at API boundaries to attach a configured `logs.Logger` to the context chain; do not thread ad hoc loggers through option structs for normal control flow.
+- Where no context exists, use `logs.Default()` sparingly.
 - Use stable keys across the codebase (for example: `op`, `component`, `request_id`, `resource`, `latency_ms`, `err`).
 - Keep log messages concise and machine-queryable; put variable data in fields, not free-form strings.
 - Use log levels consistently (`debug`, `info`, `warn`, `error`) and avoid noisy logs in hot paths.

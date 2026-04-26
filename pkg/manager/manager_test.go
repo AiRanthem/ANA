@@ -7,8 +7,8 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"log/slog"
 	"net/http"
+
 	"path"
 	"path/filepath"
 	"strings"
@@ -37,7 +37,7 @@ func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 	builder.RegisterAgentSpec(&fakeAgentSpec{})
 	builder.RegisterAgentSpec(&fakeAgentSpec{})
 
-	if _, err := builder.Build(); !errors.Is(err, agent.ErrAgentTypeConflict) {
+	if _, err := builder.Build(context.Background()); !errors.Is(err, agent.ErrAgentTypeConflict) {
 		t.Fatalf("Build() duplicate agent error = %v, want ErrAgentTypeConflict", err)
 	}
 
@@ -52,7 +52,7 @@ func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 	builder.RegisterAgentSpec(&fakeAgentSpec{})
 	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
 
-	managerInstance, err := builder.Build()
+	managerInstance, err := builder.Build(context.Background())
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 		}
 	})
 
-	if _, err := builder.Build(); err == nil {
+	if _, err := builder.Build(context.Background()); err == nil {
 		t.Fatalf("second Build() error = nil, want non-nil")
 	}
 }
@@ -311,7 +311,6 @@ func newTestManager(t *testing.T, opts testManagerOptions) Manager {
 	}
 	builder.PluginStorage = plugin.NewMemoryStorage()
 	builder.WorkspaceRepository = workspace.NewMemoryRepository()
-	builder.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_fixed"),
 		nextWorkspaceID: WorkspaceID("wsp_fixed"),
@@ -323,7 +322,7 @@ func newTestManager(t *testing.T, opts testManagerOptions) Manager {
 	builder.RegisterAgentSpec(opts.spec)
 	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
 
-	managerInstance, err := builder.Build()
+	managerInstance, err := builder.Build(context.Background())
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}

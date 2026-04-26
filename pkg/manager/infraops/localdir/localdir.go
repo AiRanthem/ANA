@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AiRanthem/ANA/pkg/logs"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 )
 
@@ -66,8 +66,8 @@ type ops struct {
 }
 
 // New constructs the localdir infraops backend from options.
-func New(opts infraops.Options) (infraops.InfraOps, error) {
-	parsed, err := parseOptions(opts)
+func New(ctx context.Context, opts infraops.Options) (infraops.InfraOps, error) {
+	parsed, err := parseOptions(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +97,7 @@ func New(opts infraops.Options) (infraops.InfraOps, error) {
 	}, nil
 }
 
-func parseOptions(opts infraops.Options) (options, error) {
+func parseOptions(ctx context.Context, opts infraops.Options) (options, error) {
 	var out options
 	if opts == nil {
 		opts = infraops.Options{}
@@ -134,7 +134,7 @@ func parseOptions(opts infraops.Options) (options, error) {
 	}
 	cleanDir := filepath.Clean(dir)
 	if isDeniedDir(cleanDir) {
-		slog.Warn("localdir.New rejected denied path", "op", "localdir.new", "path", cleanDir)
+		logs.FromContext(ctx).Warn("localdir.New rejected denied path", "op", "localdir.new", "path", cleanDir)
 		return options{}, newInvalidDirError("dir is denied: %q", cleanDir)
 	}
 	out.dir = cleanDir
@@ -522,10 +522,10 @@ func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.Exec
 	}
 
 	if stdoutBuf.Truncated() {
-		slog.Warn("localdir exec stdout truncated", "op", "localdir.exec", "program", cmd.Program, "bytes", len(result.Stdout))
+		logs.FromContext(ctx).Warn("localdir exec stdout truncated", "op", "localdir.exec", "program", cmd.Program, "bytes", len(result.Stdout))
 	}
 	if stderrBuf.Truncated() {
-		slog.Warn("localdir exec stderr truncated", "op", "localdir.exec", "program", cmd.Program, "bytes", len(result.Stderr))
+		logs.FromContext(ctx).Warn("localdir exec stderr truncated", "op", "localdir.exec", "program", cmd.Program, "bytes", len(result.Stderr))
 	}
 
 	if runErr == nil {
@@ -939,4 +939,9 @@ func (b *cappedBuffer) Bytes() []byte {
 
 func (b *cappedBuffer) Truncated() bool {
 	return b.truncated
+}
+
+// Factory is an [infraops.Factory] for the localdir backend.
+func Factory(ctx context.Context, opts infraops.Options) (infraops.InfraOps, error) {
+	return New(ctx, opts)
 }

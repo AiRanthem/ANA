@@ -42,6 +42,16 @@ the same change.
   `types.go`. Use the named types at function signatures; raw strings
   are reserved for serialization boundaries.
 
+## Logging
+
+- Emit logs with **`logs.FromContext(ctx)`**. The manager attaches
+  `Builder.Logger` on the `Build` context via **`logs.IntoContext`**;
+  **`workspace.Controller.Start`** / **`workspace.ProbeScheduler.Start`**
+  take that context and use **`context.WithoutCancel`** so install and
+  probe loops keep the logger without inheriting parent cancellation.
+  Direct tests that call `Start(context.Background())` use
+  **`logs.Default()`** as the fallback logger.
+
 ## Naming
 
 - Logger keys: `op`, `component`, `workspace_id`, `workspace_alias`,
