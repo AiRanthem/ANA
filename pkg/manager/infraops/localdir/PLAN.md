@@ -50,8 +50,9 @@ Validation:
   bits. Default `0o022`.
 - `base_env` is the literal slice prepended to the manager process'
   env (which is otherwise inherited verbatim by `Exec`).
-- `request_loopback_host` overrides the IP/host used by `Request`
-  (default `127.0.0.1`). IPv6 callers set `"::1"`.
+- `request_loopback_host` overrides the IP used by `Request`
+  (default `127.0.0.1`). Values MUST parse as a loopback IP (`127.0.0.1`,
+  `::1`, …); hostnames such as `localhost` are rejected. IPv6 callers set `"::1"`.
 
 Unknown keys produce `ErrInvalidOption` so typos do not silently
 drift; the v1 reference uses an allow-list of the keys above.
@@ -62,13 +63,27 @@ drift; the v1 reference uses an allow-list of the keys above.
 
 1. Stat the parent of `dir`; if missing, return
    `ErrInvalidDir`.
-2. Stat `dir`. If it exists and is non-empty, return
-   `ErrAlreadyInitialized` (per the interface contract).
-3. If it exists and is empty, accept it. Otherwise, `os.MkdirAll(dir,
+2. `Lstat` `dir`. The final path component MUST NOT be a symlink; reject
+   with `ErrInvalidDir` wrapping `ErrInvalidOption`.
+3. If `dir` exists and is non-empty, return `ErrAlreadyInitialized` (per
+   the interface contract).
+4. If it exists and is empty, accept it. Otherwise, `os.MkdirAll(dir,
    0o755)`.
-4. Open an `*os.Root` rooted at `dir` and stash it on the instance —
-   subsequent file ops resolve through it, blocking traversal
-   escapes natively.
+5. Open an `*os.Root` rooted at `dir` and stash it on the instance.
+
+### `Open(ctx)`
+
+1. `Lstat` `dir`; if missing, return `ErrNotInitialized`.
+2. Reject symlinks and non-directories like `Init`.
+3. Open `*os.Root` at `dir` and stash it (same initialized state as after
+   `Init`, without requiring an empty directory).
+
+### `Clear(ctx)`
+
+Clears contents through the opened `*os.Root` (`RemoveAll` per entry),
+never `os.RemoveAll` on an unanchored path join. When `keep_dir` is false,
+removes `dir` only after verifying the on-disk path is still the same
+device/inode as the opened root (so a replaced path is not followed).
 
 ### `Exec(ctx, cmd)`
 
@@ -146,7 +161,7 @@ avoid socket churn.
 - The factory rejects `dir` paths whose parent does not already
   exist, to avoid surprise `MkdirAll` of `/tmp/some/deep/path`.
 
-## Tests to write (no implementation in this pass)
+## Tests to write
 
 1. `New` rejects relative `dir`, missing `dir`, deny-listed roots,
    unknown options.

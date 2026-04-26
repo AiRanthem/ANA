@@ -621,10 +621,16 @@ type InfraOps interface {
     // Dir returns the absolute working directory inside the infra.
     Dir() string
 
-    // Init prepares the working directory. After a successful Init,
-    // Dir() exists and is empty. Calling Init on an already-initialized
-    // dir returns ErrAlreadyInitialized.
+    // Init prepares a newly-created backing state (empty directory for
+    // localdir). Calling Init on non-empty or already-initialized state
+    // returns ErrAlreadyInitialized / ErrDirNotEmpty as documented in
+    // infraops/PLAN.md.
     Init(ctx context.Context) error
+
+    // Open attaches to existing backing state. It must not create or clear
+    // state. The probe scheduler calls Open before Probe; the install worker
+    // uses Init for create-time setup then operates on the same instance.
+    Open(ctx context.Context) error
 
     // Exec runs a structured command relative to Dir(). Stdout/Stderr
     // are buffered into ExecResult unless the caller supplies streamers
@@ -694,8 +700,10 @@ The factory is invoked in three situations:
 2. Workspace install worker — once per provisioning.
 3. Probe scheduler — once per probe tick per workspace.
 
-Therefore factories MUST be cheap to call (do real work in `Init`, not
-in the constructor).
+Therefore factories MUST be cheap to call (do real work in `Init` /
+`Open`, not in the constructor). Callers that attach to existing disk
+state (probes, deletes) use `Open`; provisioning uses `Init` then
+continues on the same `InfraOps` without a second `Open`.
 
 ## 8. AgentSpec Contract
 

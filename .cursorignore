@@ -1,0 +1,22 @@
+# Git / editor / local agent artifacts
+.git/
+.vscode/
+.cursor/settings.json
+.codex/
+# Build & test artifacts
+*.out
+*.test
+coverage.*
+*.coverprofile
+profile.cov
+# Common binaries / libs
+*.exe
+*.dll
+*.so
+*.dylib
+# Go workspace-local files
+go.work
+go.work.sum
+# Secrets / env
+.env
+.env.*
