@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/AiRanthem/ANA/pkg/manager/agent"
+	"github.com/AiRanthem/ANA/pkg/manager/agent/claudecode"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 	"github.com/AiRanthem/ANA/pkg/manager/plugin"
 )
@@ -724,6 +725,43 @@ func (i *fakeInfra) Clear(context.Context) error {
 	i.state.appendEvent("clear")
 	i.state.clearCalls.Add(1)
 	return i.state.clearErr
+}
+
+func TestAttachPlugins_RejectsBatchLayoutDirectoryCollision(t *testing.T) {
+	t.Parallel()
+
+	storage := plugin.NewMemoryStorage()
+	objA := seedPluginZip(t, storage, plugin.PluginID("plg_a"), "my--plugin")
+	objB := seedPluginZip(t, storage, plugin.PluginID("plg_b"), "my-plugin")
+
+	ccSpec, err := claudecode.New(claudecode.Options{})
+	if err != nil {
+		t.Fatalf("claudecode.New() error = %v", err)
+	}
+
+	c := &Controller{
+		pluginStorage: storage,
+		maxPluginSize: 1 << 20,
+	}
+
+	plugins := []AttachedPlugin{
+		{PluginID: PluginID("plg_a"), Name: "my--plugin", ContentHash: objA.ContentHash},
+		{PluginID: PluginID("plg_b"), Name: "my-plugin", ContentHash: objB.ContentHash},
+	}
+
+	state := &fakeInfraState{dir: "ws", files: make(map[string][]byte)}
+	ops := &fakeInfra{state: state}
+
+	_, err = c.attachPlugins(context.Background(), ops, ccSpec, plugins)
+	if !errors.Is(err, agent.ErrInvalidPluginLayout) {
+		t.Fatalf("attachPlugins() error = %v, want ErrInvalidPluginLayout", err)
+	}
+	state.mu.Lock()
+	nFiles := len(state.files)
+	state.mu.Unlock()
+	if nFiles != 0 {
+		t.Fatalf("infra files written = %d, want 0 (preflight should fail before Apply)", nFiles)
+	}
 }
 
 func seedPluginZip(t *testing.T, storage *plugin.MemoryStorage, id plugin.PluginID, name string) plugin.StoredObject {

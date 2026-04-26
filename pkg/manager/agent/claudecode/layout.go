@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/AiRanthem/ANA/pkg/manager/agent"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 	"github.com/AiRanthem/ANA/pkg/manager/plugin"
 )
@@ -38,13 +39,19 @@ type writePlan struct {
 	mode   fs.FileMode
 }
 
-func (l *layout) Apply(ctx context.Context, ops infraops.InfraOps, manifest plugin.Manifest, pluginRoot fs.FS) ([]string, error) {
+func (l *layout) PluginDirectoryKey(manifest plugin.Manifest) (string, error) {
 	pluginName := sanitizePluginName(manifest.Plugin.Name)
 	if pluginName == "" {
-		return nil, fmt.Errorf("%w: plugin name %q sanitizes to empty", ErrInvalidPluginLayout, manifest.Plugin.Name)
+		return "", fmt.Errorf("%w: plugin name %q sanitizes to empty", agent.ErrInvalidPluginLayout, manifest.Plugin.Name)
 	}
+	return path.Join(".claude", "plugins", pluginName), nil
+}
 
-	pluginBase := path.Join(".claude", "plugins", pluginName)
+func (l *layout) Apply(ctx context.Context, ops infraops.InfraOps, manifest plugin.Manifest, pluginRoot fs.FS) ([]string, error) {
+	pluginBase, err := l.PluginDirectoryKey(manifest)
+	if err != nil {
+		return nil, err
+	}
 	if err := ensureNoPluginNameCollision(ctx, ops, pluginBase); err != nil {
 		return nil, err
 	}

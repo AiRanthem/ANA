@@ -152,8 +152,21 @@ func (c *Controller) Start(ctx context.Context) error {
 func (c *Controller) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	if c.stopped {
+		started := c.started
+		workersDone := c.workersDone
 		c.mu.Unlock()
-		return ErrControllerShutdown
+		if !started {
+			return nil
+		}
+		if workersDone == nil {
+			return nil
+		}
+		select {
+		case <-workersDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	c.stopped = true
 	started := c.started
@@ -396,10 +409,24 @@ func (c *Controller) attachPlugins(ctx context.Context, ops infraops.InfraOps, s
 		return nil, nil
 	}
 
-	attached := make([]AttachedPlugin, 0, len(plugins))
+	type openedPlugin struct {
+		ref    AttachedPlugin
+		reader plugin.Reader
+	}
+
+	opened := make([]openedPlugin, 0, len(plugins))
+	closeReaders := func() {
+		for _, o := range opened {
+			if o.reader != nil {
+				_ = o.reader.Close()
+			}
+		}
+	}
+
 	for _, pluginRef := range plugins {
 		body, obj, err := c.pluginStorage.Get(ctx, plugin.PluginID(pluginRef.PluginID))
 		if err != nil {
+			closeReaders()
 			if errors.Is(err, plugin.ErrStorageNotFound) {
 				return nil, fmt.Errorf("%w: %q", plugin.ErrPluginNotFound, pluginRef.PluginID)
 			}
@@ -407,12 +434,14 @@ func (c *Controller) attachPlugins(ctx context.Context, ops infraops.InfraOps, s
 		}
 		if obj.ContentHash != pluginRef.ContentHash {
 			_ = body.Close()
+			closeReaders()
 			return nil, fmt.Errorf("%w for plugin %q: snapshot %q storage %q", ErrPluginContentHashMismatch, pluginRef.PluginID, pluginRef.ContentHash, obj.ContentHash)
 		}
 
 		reader, openErr := plugin.OpenZipReaderFromStream(ctx, body, obj.Size, c.maxPluginSize)
 		closeErr := body.Close()
 		if openErr != nil {
+			closeReaders()
 			if closeErr != nil {
 				return nil, errors.Join(openErr, closeErr)
 			}
@@ -420,22 +449,52 @@ func (c *Controller) attachPlugins(ctx context.Context, ops infraops.InfraOps, s
 		}
 		if closeErr != nil {
 			_ = reader.Close()
+			closeReaders()
 			return nil, closeErr
 		}
 
-		placedPaths, applyErr := spec.PluginLayout().Apply(ctx, ops, reader.Manifest(), reader.FS())
-		readerCloseErr := reader.Close()
+		opened = append(opened, openedPlugin{ref: pluginRef, reader: reader})
+	}
+
+	layout := spec.PluginLayout()
+	if lk, ok := layout.(agent.PluginLayoutDirectoryKey); ok {
+		seen := make(map[string]struct{}, len(opened))
+		for _, o := range opened {
+			dir, err := lk.PluginDirectoryKey(o.reader.Manifest())
+			if err != nil {
+				closeReaders()
+				return nil, err
+			}
+			if dir == "" {
+				continue
+			}
+			if _, dup := seen[dir]; dup {
+				closeReaders()
+				return nil, fmt.Errorf("%w: duplicate plugin layout directory %q", agent.ErrInvalidPluginLayout, dir)
+			}
+			seen[dir] = struct{}{}
+		}
+	}
+
+	attached := make([]AttachedPlugin, 0, len(opened))
+	for i := range opened {
+		o := &opened[i]
+		placedPaths, applyErr := layout.Apply(ctx, ops, o.reader.Manifest(), o.reader.FS())
+		readerCloseErr := o.reader.Close()
+		o.reader = nil
 		if applyErr != nil {
+			closeReaders()
 			if readerCloseErr != nil {
 				return nil, errors.Join(applyErr, readerCloseErr)
 			}
 			return nil, applyErr
 		}
 		if readerCloseErr != nil {
+			closeReaders()
 			return nil, readerCloseErr
 		}
 
-		attachedPlugin := pluginRef
+		attachedPlugin := o.ref
 		attachedPlugin.PlacedPaths = slices.Clone(placedPaths)
 		attached = append(attached, attachedPlugin)
 	}

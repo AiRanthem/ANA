@@ -85,6 +85,16 @@ type PluginLayout interface {
 	Apply(ctx context.Context, ops infraops.InfraOps, manifest plugin.Manifest, pluginRoot fs.FS) ([]string, error)
 }
 
+// PluginLayoutDirectoryKey is implemented by layouts that reserve one
+// filesystem directory per plugin manifest (for example
+// .claude/plugins/<name>). The workspace controller uses it to reject
+// multi-plugin attach batches that would map to the same directory before
+// calling Apply on any plugin, avoiding partial on-disk writes.
+type PluginLayoutDirectoryKey interface {
+	PluginLayout
+	PluginDirectoryKey(manifest plugin.Manifest) (dir string, err error)
+}
+
 // AgentSpec describes how to install/probe/uninstall a concrete agent type.
 type AgentSpec interface {
 	Type() AgentType

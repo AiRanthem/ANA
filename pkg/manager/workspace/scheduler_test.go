@@ -194,6 +194,55 @@ func TestProbeSchedulerOverrunCounter(t *testing.T) {
 	}
 }
 
+func TestProbeSchedulerStop_SecondCallCompletesAfterFirstDeadline(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		interval: 10 * time.Millisecond,
+		timeout:  time.Second,
+		probeFn: func(context.Context, infraops.InfraOps) (agent.ProbeResult, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return agent.ProbeResult{Healthy: true}, nil
+		},
+	})
+
+	h.insertWorkspace(t, "wsp_stop_retry", "stop-retry", StatusHealthy)
+
+	if err := h.scheduler.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("probe did not start")
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	err := h.scheduler.Stop(shortCtx)
+	cancel()
+	if err == nil {
+		t.Fatalf("Stop(short) error = nil, want deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop(short) error = %v, want DeadlineExceeded", err)
+	}
+
+	close(release)
+
+	if err := h.scheduler.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(bg) error = %v", err)
+	}
+	if err := h.scheduler.Stop(context.Background()); err != nil {
+		t.Fatalf("third Stop error = %v", err)
+	}
+}
+
 type schedulerHarnessOptions struct {
 	clock          func() time.Time
 	interval       time.Duration

@@ -67,6 +67,37 @@ func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 	}
 }
 
+func TestManagerStop_SecondCallSucceedsIdempotently(t *testing.T) {
+	t.Parallel()
+
+	builder := NewBuilder()
+	builder.PluginRepository = plugin.NewMemoryRepository()
+	builder.PluginStorage = plugin.NewMemoryStorage()
+	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.IDGenerator = fixedIDGenerator{
+		nextPluginID:    PluginID("plg_test"),
+		nextWorkspaceID: WorkspaceID("wsp_test"),
+	}
+	builder.InstallWorkers = 1
+	builder.ProbeInterval = time.Hour
+	builder.ProbeWorkers = 1
+	builder.ProbeTimeout = time.Second
+	builder.RegisterAgentSpec(&fakeAgentSpec{})
+	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
+
+	managerInstance, err := builder.Build(context.Background())
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	if err := managerInstance.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := managerInstance.Stop(context.Background()); err != nil {
+		t.Fatalf("second Stop() error = %v, want nil", err)
+	}
+}
+
 func TestManagerCreatePluginUpsertsByNamespaceAndName(t *testing.T) {
 	t.Parallel()
 

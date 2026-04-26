@@ -239,8 +239,9 @@ type managerFacade struct {
 	controller          *workspace.Controller
 	scheduler           *workspace.ProbeScheduler
 
-	mu              sync.RWMutex
-	shutdownStarted bool
+	mu             sync.RWMutex
+	stopInProgress bool
+	shutDown       bool
 }
 
 var _ Manager = (*managerFacade)(nil)
@@ -693,23 +694,38 @@ func (m *managerFacade) Stop(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
-	if m.shutdownStarted {
+	if m.shutDown {
 		m.mu.Unlock()
-		return fmt.Errorf("%s: %w", opStop, ErrShutdown)
+		return nil
 	}
-	m.shutdownStarted = true
+	if m.stopInProgress {
+		m.mu.Unlock()
+		return fmt.Errorf("%s: shutdown already in progress", opStop)
+	}
+	m.stopInProgress = true
 	m.mu.Unlock()
 
 	if err := m.scheduler.Stop(ctx); err != nil {
+		m.mu.Lock()
+		m.stopInProgress = false
+		m.mu.Unlock()
 		return fmt.Errorf("%s: %w", opStop, err)
 	}
 	if err := m.controller.Stop(ctx); err != nil {
+		m.mu.Lock()
+		m.stopInProgress = false
+		m.mu.Unlock()
 		return fmt.Errorf("%s: %w", opStop, err)
 	}
 
 	m.closeQuietly(ctx, opStop, m.workspaceRepository.Close)
 	m.closeQuietly(ctx, opStop, m.pluginRepository.Close)
 	m.closeQuietly(ctx, opStop, m.pluginStorage.Close)
+
+	m.mu.Lock()
+	m.stopInProgress = false
+	m.shutDown = true
+	m.mu.Unlock()
 	return nil
 }
 
@@ -751,7 +767,7 @@ func (m *managerFacade) resolveAttachedPlugins(ctx context.Context, refs []Plugi
 func (m *managerFacade) ensureAvailable(op string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.shutdownStarted {
+	if m.shutDown || m.stopInProgress {
 		return fmt.Errorf("%s: %w", op, ErrShutdown)
 	}
 	return nil

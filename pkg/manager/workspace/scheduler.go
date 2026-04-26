@@ -140,8 +140,21 @@ func (s *ProbeScheduler) Start(ctx context.Context) error {
 func (s *ProbeScheduler) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.stopped {
+		started := s.started
+		loopDone := s.loopDone
 		s.mu.Unlock()
-		return ErrSchedulerShutdown
+		if !started {
+			return nil
+		}
+		if loopDone == nil {
+			return nil
+		}
+		select {
+		case <-loopDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.stopped = true
 	started := s.started
