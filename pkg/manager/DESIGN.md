@@ -77,8 +77,8 @@ orchestrator's `registry`). This boundary is documented in §11.
   through `infraops.Options` or `AgentSpec.InstallParams`, but the
   manager neither stores nor rotates them.
 - No retention or GC of audit / log artifacts. The manager records
-  status; logs are emitted via `log/slog` and consumed by the
-  deployment.
+  status; logs are emitted via **`pkg/logs`** (`logs.FromContext(ctx)` on
+  contexts that carry a logger) and consumed by the deployment.
 - No long-running orchestration of agent **runs**. Driving an agent
   through a task is the orchestrator's job; the manager only ensures the
   workspace is reachable.
@@ -182,7 +182,9 @@ binary depends on. It owns:
 - An immutable `infraFactories` registry built from `RegisterInfraType`.
 - A background **probe scheduler** that periodically calls
   `AgentSpec.Probe` on every active workspace.
-- A logger (`*slog.Logger`) for observability.
+- A `logs.Logger` for observability, injected on the context at `Build`
+  time via `logs.IntoContext` and read everywhere else with
+  `logs.FromContext(ctx)`.
 
 The Manager exposes:
 
@@ -250,7 +252,7 @@ type Builder struct {
     // optional collaborators (defaults provided)
     Clock        func() time.Time
     IDGenerator  IDGenerator   // see §6.8
-    Logger       *slog.Logger
+    Logger       logs.Logger   // optional; wired into ctx at Build via logs.IntoContext
 
     // install worker tuning (optional)
     InstallTimeout time.Duration // default 10 min
@@ -268,10 +270,10 @@ type Builder struct {
 func NewBuilder() *Builder
 func (b *Builder) RegisterAgentSpec(spec agent.AgentSpec) *Builder
 func (b *Builder) RegisterInfraType(infraType InfraType, factory infraops.Factory) *Builder
-func (b *Builder) Build() (Manager, error)
+func (b *Builder) Build(ctx context.Context) (Manager, error)
 ```
 
-`Build()` returns an error if:
+`Build(ctx)` returns an error if:
 
 - a required backend is nil,
 - two `AgentSpec` values declare the same `Type()`,
@@ -279,10 +281,10 @@ func (b *Builder) Build() (Manager, error)
 
 A manager with zero registered agent types or zero registered infra
 types is allowed (a "plugin-only" manager that just hosts the plugin
-catalog still validates) but emits `slog.Warn` so the operator can spot
-misconfiguration.
+catalog still validates) but emits **`logs.FromContext(ctx).Warn`**
+so the operator can spot misconfiguration.
 
-The `Builder` is **single-use**: `Build()` consumes it. Re-using the
+The `Builder` is **single-use**: `Build` consumes it. Re-using the
 builder after `Build` returns is an error.
 
 ## 4. End-to-End Walkthrough
@@ -394,8 +396,11 @@ ErrWorkspaceNotFound without side effects.
 User → Manager.DeletePlugin(plugin_id)
 
 1. PluginRepository.Get(plugin_id) → Plugin or ErrPluginNotFound.
-2. PluginStorage.Delete(plugin_id) → removes the zip from the backend.
-3. PluginRepository.Delete(plugin_id) → removes the metadata row.
+2. PluginRepository.Delete(plugin_id) → removes the metadata row first so
+   callers never see a row whose blob is already gone if storage delete fails.
+3. PluginStorage.Delete(plugin_id) → removes the zip from the backend.
+   A failed storage delete after a successful metadata delete leaves an orphan
+   blob, which is preferable to queryable metadata without bytes.
 
 Workspaces that previously attached this plugin keep their on-disk
 plugin files (the manager does not enforce referential integrity at
@@ -621,10 +626,16 @@ type InfraOps interface {
     // Dir returns the absolute working directory inside the infra.
     Dir() string
 
-    // Init prepares the working directory. After a successful Init,
-    // Dir() exists and is empty. Calling Init on an already-initialized
-    // dir returns ErrAlreadyInitialized.
+    // Init prepares a newly-created backing state (empty directory for
+    // localdir). Calling Init on non-empty or already-initialized state
+    // returns ErrAlreadyInitialized / ErrDirNotEmpty as documented in
+    // infraops/PLAN.md.
     Init(ctx context.Context) error
+
+    // Open attaches to existing backing state. It must not create or clear
+    // state. The probe scheduler calls Open before Probe; the install worker
+    // uses Init for create-time setup then operates on the same instance.
+    Open(ctx context.Context) error
 
     // Exec runs a structured command relative to Dir(). Stdout/Stderr
     // are buffered into ExecResult unless the caller supplies streamers
@@ -694,8 +705,10 @@ The factory is invoked in three situations:
 2. Workspace install worker — once per provisioning.
 3. Probe scheduler — once per probe tick per workspace.
 
-Therefore factories MUST be cheap to call (do real work in `Init`, not
-in the constructor).
+Therefore factories MUST be cheap to call (do real work in `Init` /
+`Open`, not in the constructor). Callers that attach to existing disk
+state (probes, deletes) use `Open`; provisioning uses `Init` then
+continues on the same `InfraOps` without a second `Open`.
 
 ## 8. AgentSpec Contract
 
@@ -810,7 +823,14 @@ type InstallParams struct {
 
 ### 9.1 Structured logging
 
-Every log line uses `*slog.Logger` with stable keys:
+Every log line uses **`logs.FromContext(ctx)`** (falling back to
+`logs.Default()` when no logger is stored on `ctx`) with stable keys.
+Optional `Builder.Logger` is applied once at **`Build`** with
+`logs.IntoContext` on the `ctx` passed into `workspace.Controller.Start`
+and `workspace.ProbeScheduler.Start`. Those `Start` methods derive a
+long-lived root with **`context.WithoutCancel`** so worker cancellation
+is independent of the `Build` caller's deadline/cancel, while logger
+values still propagate from that `ctx`.
 
 | Key                | Description |
 |--------------------|-------------|
@@ -875,8 +895,9 @@ operators want a separate audit trail, they wrap the repositories.
   `Close` on the workspace repository, plugin repository, and plugin
   storage in that order; close errors are logged but do not abort
   shutdown. After `Stop`, the Manager rejects new operations with
-  `ErrShutdown`. The manager does NOT close the `*slog.Logger`,
-  `agent.SpecSet`, or `infraops.FactorySet` — those are caller-owned.
+  `ErrShutdown`. The manager does NOT close the configured
+  `logs.Logger` / underlying handler, `agent.SpecSet`, or
+  `infraops.FactorySet` — those are caller-owned.
 
 ### 10.3 Crash safety
 

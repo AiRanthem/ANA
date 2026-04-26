@@ -49,6 +49,7 @@ type InfraOps interface {
     Dir() string
 
     Init(ctx context.Context) error
+    Open(ctx context.Context) error
 
     Exec(ctx context.Context, cmd ExecCommand) (ExecResult, error)
 
@@ -181,7 +182,7 @@ breaks every implementation, so we keep the surface tight.
    ┌────────────────┐
    │  constructed   │   Type(), Dir() OK
    └──────┬─────────┘
-          │ Init()
+          │ Init()  (create-time)  or  Open()  (attach to existing state)
    ┌──────▼─────────┐
    │ initialized    │   all methods OK
    └──────┬─────────┘
@@ -193,8 +194,12 @@ breaks every implementation, so we keep the surface tight.
 
 Rules:
 
-- `Init()` is required before `Exec`/`PutFile`/`GetFile`/`Request`.
-  Calling those before `Init` returns `ErrNotInitialized`.
+- `Init()` or `Open()` is required before `Exec`/`PutFile`/`GetFile`/`Request`.
+  Calling those before initialization returns `ErrNotInitialized`.
+- `Open()` attaches to existing backing state and must not create or clear
+  it. The probe scheduler calls `Open` before `Probe` on a fresh factory
+  instance; installs use `Init` on a new directory then continue without
+  calling `Open` again on the same instance.
 - `Init()` is idempotent in the *constructive* sense only: if the
   backing state already exists from a previous run, `Init` returns
   `ErrAlreadyInitialized`. The workspace controller catches this on
@@ -231,8 +236,8 @@ Per-implementation options are documented in that implementation's
 PLAN. Examples: `"image"` for Docker, `"template_id"` for E2B,
 `"keep_dir"` for `localdir`.
 
-Factories MUST be cheap: do real work in `Init`, not in the factory.
-The manager constructs `InfraOps` per probe tick.
+Factories MUST be cheap: do real work in `Init`/`Open`, not in the factory.
+The manager constructs `InfraOps` per probe tick and calls `Open` before probing.
 
 ### FactorySet
 
