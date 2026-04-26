@@ -348,7 +348,7 @@ func TestProtocolDescriptor_StableAcrossCalls(t *testing.T) {
 	want := agent.ProtocolDescriptor{
 		Kind: agent.ProtocolKindCLI,
 		Detail: map[string]any{
-			"command":             []any{"claude", "code"},
+			"command":             []any{"claude"},
 			"resume_flag":         "--resume",
 			"cwd_relative_to_dir": "",
 			"stdin_input":         true,

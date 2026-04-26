@@ -240,6 +240,119 @@ func TestNewInfraOps_RejectsEmptyDir(t *testing.T) {
 	}
 }
 
+func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing.T) {
+	t.Parallel()
+
+	// P1 regression: Insert succeeds, then Stop races so Submit returns
+	// ErrControllerShutdown. CreateWorkspace must delete the row. Manager.Stop
+	// closes the workspace repository; this wrapper's Close is a no-op so the
+	// compensating Delete can still run on the underlying MemoryRepository.
+
+	pluginRepo := plugin.NewMemoryRepository()
+	pluginStorage := plugin.NewMemoryStorage()
+	innerWS := workspace.NewMemoryRepository()
+	pauseRepo := &pauseInsertWorkspaceRepo{
+		MemoryRepository: innerWS,
+		insertDone:       make(chan struct{}),
+		allowProceed:     make(chan struct{}),
+	}
+
+	spec := &fakeAgentSpec{}
+	builder := NewBuilder()
+	builder.PluginRepository = pluginRepo
+	builder.PluginStorage = pluginStorage
+	builder.WorkspaceRepository = pauseRepo
+	builder.IDGenerator = fixedIDGenerator{
+		nextPluginID:    PluginID("plg_fixed"),
+		nextWorkspaceID: WorkspaceID("wsp_shutdown_race"),
+	}
+	builder.InstallWorkers = 1
+	builder.ProbeInterval = time.Hour
+	builder.ProbeWorkers = 1
+	builder.ProbeTimeout = time.Minute
+	builder.RegisterAgentSpec(spec)
+	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
+
+	managerInstance, err := builder.Build(context.Background())
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if err := managerInstance.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = managerInstance.Stop(context.Background()) })
+
+	pluginBody := buildPluginZip(t, "demo-plugin", "test-body")
+	plug, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "demo-plugin",
+		Content: bytes.NewReader(pluginBody),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	alias := Alias("ShutdownRace")
+	dir := t.TempDir()
+	wantID := workspace.WorkspaceID("wsp_shutdown_race")
+
+	var createErr error
+	createDone := make(chan struct{})
+	go func() {
+		defer close(createDone)
+		_, createErr = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+			Alias:        alias,
+			AgentType:    AgentType("claude-code"),
+			InfraType:    InfraType("localdir"),
+			InfraOptions: infraops.Options{"dir": dir},
+			Plugins:      []PluginRef{{ID: plug.ID}},
+		})
+	}()
+
+	<-pauseRepo.insertDone
+
+	if err := managerInstance.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	close(pauseRepo.allowProceed)
+	<-createDone
+
+	if createErr == nil {
+		t.Fatal("CreateWorkspace() error = nil, want non-nil")
+	}
+	if !errors.Is(createErr, workspace.ErrControllerShutdown) {
+		t.Fatalf("CreateWorkspace() error = %v, want errors.Is(..., workspace.ErrControllerShutdown)", createErr)
+	}
+
+	if _, err := innerWS.Get(context.Background(), wantID); !errors.Is(err, workspace.ErrWorkspaceNotFound) {
+		t.Fatalf("Get(%q) after failed create error = %v, want ErrWorkspaceNotFound", wantID, err)
+	}
+}
+
+// pauseInsertWorkspaceRepo blocks after a successful Insert until allowProceed
+// is closed, so the test can call Manager.Stop before Submit runs.
+// Close is a no-op so Manager.Stop does not mark the inner MemoryRepository
+// closed before CreateWorkspace's compensating Delete runs.
+type pauseInsertWorkspaceRepo struct {
+	*workspace.MemoryRepository
+	insertOnce   sync.Once
+	insertDone   chan struct{}
+	allowProceed chan struct{}
+}
+
+func (r *pauseInsertWorkspaceRepo) Insert(ctx context.Context, w workspace.Workspace) error {
+	if err := r.MemoryRepository.Insert(ctx, w); err != nil {
+		return err
+	}
+	r.insertOnce.Do(func() { close(r.insertDone) })
+	<-r.allowProceed
+	return nil
+}
+
+func (r *pauseInsertWorkspaceRepo) Close(context.Context) error {
+	return nil
+}
+
 func TestManagerCreateWorkspaceWiresRepositoriesAndLifecycle(t *testing.T) {
 	t.Parallel()
 
