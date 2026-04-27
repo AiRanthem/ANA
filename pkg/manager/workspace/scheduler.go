@@ -240,15 +240,18 @@ func (s *ProbeScheduler) runTick(ctx context.Context) error {
 		switch row.Status {
 		case StatusInit:
 			if s.installTimedOut(now, row) {
-				if err := s.repo.UpdateStatusCAS(
-					context.Background(),
+				persistCtx, cancel := newRepoWriteContext(ctx)
+				err := s.repo.UpdateStatusCAS(
+					persistCtx,
 					row.ID,
 					StatusWriterScheduler,
 					StatusInit,
 					StatusFailed,
 					failureFromError(now, "install", ErrInstallTimeout),
 					time.Time{},
-				); err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
+				)
+				cancel()
+				if err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
 					logs.FromContext(ctx).Error("workspace init timeout transition failed",
 						"component", "workspace_scheduler",
 						"workspace_id", row.ID,
@@ -394,9 +397,9 @@ func (s *ProbeScheduler) probeOne(ctx context.Context, row Workspace) {
 	s.probesFailed.Add(1)
 }
 
-func (s *ProbeScheduler) transitionProbeStatus(row Workspace, next Status, statusErr *Error, probedAt time.Time) error {
+func (s *ProbeScheduler) transitionProbeStatus(ctx context.Context, row Workspace, next Status, statusErr *Error, probedAt time.Time) error {
 	return s.repo.UpdateStatusCAS(
-		context.Background(),
+		ctx,
 		row.ID,
 		StatusWriterScheduler,
 		row.Status,
@@ -407,8 +410,11 @@ func (s *ProbeScheduler) transitionProbeStatus(row Workspace, next Status, statu
 }
 
 func (s *ProbeScheduler) recordProbeOutcome(logCtx context.Context, row Workspace, newStatus Status, statusErr *Error, probedAt time.Time) {
+	persistCtx, cancel := newRepoWriteContext(logCtx)
+	defer cancel()
+
 	if row.Status != newStatus {
-		if err := s.transitionProbeStatus(row, newStatus, statusErr, probedAt); err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
+		if err := s.transitionProbeStatus(persistCtx, row, newStatus, statusErr, probedAt); err != nil && !errors.Is(err, ErrStatusPreconditionFailed) {
 			logs.FromContext(logCtx).Error("workspace probe transition failed",
 				"component", "workspace_scheduler",
 				"workspace_id", row.ID,
@@ -427,7 +433,7 @@ func (s *ProbeScheduler) recordProbeOutcome(logCtx context.Context, row Workspac
 	} else {
 		updated.StatusError = cloneError(statusErr)
 	}
-	if err := s.repo.Update(context.Background(), updated); err != nil {
+	if err := s.repo.Update(persistCtx, updated); err != nil {
 		logs.FromContext(logCtx).Error("workspace probe metadata update failed",
 			"component", "workspace_scheduler",
 			"workspace_id", row.ID,

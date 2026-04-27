@@ -100,6 +100,13 @@ of the repo) during ingest.
   Plugins beyond this are rejected as `ErrCorruptArchive` (a hostile
   zip-bomb defense, not a feature limit).
 - Symlinks are rejected. Plugins MUST be portable across infras.
+- **Explicit directory entries** in the zip are allowed. A directory
+  header must use **exactly one** trailing `/` in the stored name; that
+  slash is stripped, then the same `isSafeArchivePath` / `path.Clean`
+  checks apply as for files. After normalization, a duplicate canonical
+  path is still `ErrCorruptArchive`. Directory entries are recorded in
+  the virtual `fs.FS` but **do not** appear in the manifest path
+  `fileSet` (only regular files do); directory bodies are not read.
 
 ## Manifest
 

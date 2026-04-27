@@ -27,6 +27,20 @@ func canonicalArchivePath(p string) (string, error) {
 	return cp, nil
 }
 
+func canonicalZipHeaderPath(name string, isDir bool) (string, error) {
+	raw := name
+	if isDir {
+		if !strings.HasSuffix(name, "/") || strings.HasSuffix(name, "//") {
+			return "", fmt.Errorf("%w: invalid zip directory path %q", ErrCorruptArchive, name)
+		}
+		raw = strings.TrimSuffix(raw, "/")
+	}
+	if !isSafeArchivePath(raw) {
+		return "", fmt.Errorf("%w: invalid zip path %q", ErrCorruptArchive, name)
+	}
+	return path.Clean(raw), nil
+}
+
 func mapFileModeFromZip(f *zip.File) fs.FileMode {
 	mode := f.Mode()
 	if mode&fs.ModeDir != 0 {
@@ -100,7 +114,7 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 		if err := validateZipFileHeader(f); err != nil {
 			return nil, err
 		}
-		canonicalName, err := canonicalArchivePath(f.Name)
+		canonicalName, err := canonicalZipHeaderPath(f.Name, f.FileInfo().IsDir())
 		if err != nil {
 			return nil, err
 		}
@@ -108,6 +122,12 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 			return nil, fmt.Errorf("%w: duplicate zip path %q", ErrCorruptArchive, canonicalName)
 		}
 		seen[canonicalName] = struct{}{}
+
+		if f.FileInfo().IsDir() {
+			filesys[canonicalName] = &fstest.MapFile{Mode: mapFileModeFromZip(f)}
+			continue
+		}
+
 		fileSet[canonicalName] = struct{}{}
 
 		rc, err := f.Open()
@@ -167,9 +187,6 @@ func openFromZip(zr *zip.Reader, maxExpanded int64) (Reader, error) {
 func validateZipFileHeader(f *zip.File) error {
 	if f == nil {
 		return fmt.Errorf("%w: nil zip file header", ErrCorruptArchive)
-	}
-	if !isSafeArchivePath(f.Name) {
-		return fmt.Errorf("%w: invalid zip path %q", ErrCorruptArchive, f.Name)
 	}
 
 	mode := f.Mode()

@@ -144,7 +144,12 @@ func (r *MemoryRepository) List(_ context.Context, opts ListOptions) ([]Plugin, 
 		return []Plugin{}, "", nil
 	}
 
-	end := min(offset+limit, len(filtered))
+	remaining := len(filtered) - offset
+	take := remaining
+	if limit < take {
+		take = limit
+	}
+	end := offset + take
 	next := ""
 	if end < len(filtered) {
 		next = strconv.Itoa(end)

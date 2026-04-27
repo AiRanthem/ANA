@@ -100,6 +100,14 @@ device/inode as the opened root (so a replaced path is not followed).
    errors (program not found, IO failure) bubble up.
 6. Record `Duration`.
 
+**Cwd / `WorkDir`:** After `*os.Root` validates the relative work
+directory, Linux sets `Cmd.Dir` to `/proc/self/fd/<fd>` for an opened
+directory handle so the child process is not launched with a stale
+joined string path. Non-Linux builds return `infraops.ErrPathOutsideDir`
+instead of falling back to `filepath.Join(Dir(), workDir)`. The
+implementation also rejects when the configured `dir` path is a symlink
+or no longer the same inode as the opened root (path replacement).
+
 ### `PutFile(ctx, path, content, mode)`
 
 1. Resolve `path` through the `*os.Root`; reject escapes.

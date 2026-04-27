@@ -196,7 +196,7 @@ func TestManagerCreateWorkspace_SubmitFailureDeletesRowWithoutStatusWrite(t *tes
 	}
 }
 
-func TestManagerDeletePlugin_StorageDeleteFailureDoesNotDeleteRepository(t *testing.T) {
+func TestManagerDeletePlugin_StorageDeleteFailureStillDeletesRepository(t *testing.T) {
 	t.Parallel()
 
 	inner := plugin.NewMemoryStorage()
@@ -213,13 +213,46 @@ func TestManagerDeletePlugin_StorageDeleteFailureDoesNotDeleteRepository(t *test
 		t.Fatalf("CreatePlugin() error = %v", err)
 	}
 
+	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err != nil {
+		t.Fatalf("DeletePlugin() error = %v", err)
+	}
+
+	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); !errors.Is(err, ErrPluginNotFound) {
+		t.Fatalf("GetPlugin() after DeletePlugin error = %v, want ErrPluginNotFound", err)
+	}
+}
+
+func TestManagerDeletePlugin_RepositoryDeleteFailureDoesNotDeleteBlobOrMetadata(t *testing.T) {
+	t.Parallel()
+
+	stor := plugin.NewMemoryStorage()
+	repoWrap := &errOnPluginRepoDelete{MemoryRepository: plugin.NewMemoryRepository()}
+	managerInstance := newTestManager(t, testManagerOptions{
+		pluginRepo:    repoWrap,
+		pluginStorage: stor,
+	})
+
+	body := buildPluginZip(t, "repo-fail", "blob")
+	created, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "repo-fail",
+		Content: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
 	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err == nil {
 		t.Fatal("DeletePlugin() error = nil, want non-nil")
 	}
 
 	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); err != nil {
-		t.Fatalf("GetPlugin() after failed DeletePlugin error = %v, want nil", err)
+		t.Fatalf("GetPlugin() error = %v, want metadata still present", err)
 	}
+	rc, _, err := stor.Get(context.Background(), plugin.PluginID(created.ID))
+	if err != nil {
+		t.Fatalf("storage Get() error = %v, want blob still present", err)
+	}
+	_ = rc.Close()
 }
 
 func TestManagerDeletePlugin_StorageNotFoundStillDeletesRepository(t *testing.T) {
@@ -594,6 +627,15 @@ type errOnPluginStorageDelete struct {
 
 func (errOnPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
 	return errors.New("forced storage delete failure")
+}
+
+// errOnPluginRepoDelete wraps MemoryRepository and forces Delete to fail.
+type errOnPluginRepoDelete struct {
+	*plugin.MemoryRepository
+}
+
+func (r *errOnPluginRepoDelete) Delete(ctx context.Context, id plugin.PluginID) error {
+	return errors.New("forced repository delete failure")
 }
 
 // notFoundPluginStorageDelete wraps MemoryStorage and makes Delete return ErrStorageNotFound.

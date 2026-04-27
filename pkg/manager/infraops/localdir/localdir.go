@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -515,13 +516,36 @@ func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.Exec
 	}
 	defer release()
 
+	pathInfo, err := os.Lstat(o.dir)
+	if err != nil {
+		return infraops.ExecResult{}, fmt.Errorf("localdir exec lstat dir %q: %w", o.dir, err)
+	}
+	if pathInfo.Mode()&fs.ModeSymlink != 0 {
+		return infraops.ExecResult{}, infraops.ErrPathOutsideDir
+	}
+	rootDot, err := root.Open(".")
+	if err != nil {
+		return infraops.ExecResult{}, fmt.Errorf("localdir exec open root %q: %w", o.dir, err)
+	}
+	defer rootDot.Close()
+	rootInfo, err := rootDot.Stat()
+	if err != nil {
+		return infraops.ExecResult{}, fmt.Errorf("localdir exec stat root %q: %w", o.dir, err)
+	}
+	if !os.SameFile(pathInfo, rootInfo) {
+		return infraops.ExecResult{}, infraops.ErrPathOutsideDir
+	}
+
 	if strings.TrimSpace(cmd.Program) == "" {
 		return infraops.ExecResult{}, fmt.Errorf("%w: localdir exec program must not be empty", infraops.ErrInvalidOption)
 	}
 
-	workDir, err := o.resolveWorkDir(root, cmd.WorkDir)
+	execDir, hold, err := o.resolveExecDir(root, cmd.WorkDir)
 	if err != nil {
 		return infraops.ExecResult{}, err
+	}
+	if hold != nil {
+		defer hold.Close()
 	}
 
 	runCtx := ctx
@@ -532,7 +556,7 @@ func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.Exec
 	}
 
 	execCmd := exec.CommandContext(runCtx, cmd.Program, cmd.Args...)
-	execCmd.Dir = workDir
+	execCmd.Dir = execDir
 
 	baseEnv := os.Environ()
 	execCmd.Env = make([]string, 0, len(baseEnv)+len(o.baseEnv)+len(cmd.Env))
@@ -589,27 +613,33 @@ func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.Exec
 	return infraops.ExecResult{}, fmt.Errorf("localdir exec run %q: %w", cmd.Program, runErr)
 }
 
-func (o *ops) resolveWorkDir(root *os.Root, workDir string) (string, error) {
-	if workDir == "" {
-		return o.dir, nil
-	}
-	if isPathOutsideRootLexical(workDir) {
-		return "", infraops.ErrPathOutsideDir
-	}
-	if filepath.Clean(workDir) == "." {
-		return o.dir, nil
+func (o *ops) resolveExecDir(root *os.Root, workDir string) (dir string, hold *os.File, err error) {
+	clean := "."
+	if workDir != "" {
+		if isPathOutsideRootLexical(workDir) {
+			return "", nil, infraops.ErrPathOutsideDir
+		}
+		clean = filepath.Clean(workDir)
 	}
 
-	subRoot, err := root.OpenRoot(workDir)
+	subRoot, err := root.OpenRoot(clean)
 	if err != nil {
 		if isPathEscapeError(err) {
-			return "", infraops.ErrPathOutsideDir
+			return "", nil, infraops.ErrPathOutsideDir
 		}
-		return "", fmt.Errorf("localdir exec validate workdir %q: %w", workDir, err)
+		return "", nil, fmt.Errorf("localdir exec validate workdir %q: %w", workDir, err)
 	}
-	_ = subRoot.Close()
+	defer subRoot.Close()
 
-	return filepath.Join(o.dir, filepath.Clean(workDir)), nil
+	dirFD, err := subRoot.Open(".")
+	if err != nil {
+		return "", nil, err
+	}
+	if runtime.GOOS != "linux" {
+		_ = dirFD.Close()
+		return "", nil, fmt.Errorf("localdir exec secure cwd unsupported on %s: %w", runtime.GOOS, infraops.ErrPathOutsideDir)
+	}
+	return "/proc/self/fd/" + strconv.FormatUint(uint64(dirFD.Fd()), 10), dirFD, nil
 }
 
 func (o *ops) PutFile(ctx context.Context, path string, content io.Reader, mode fs.FileMode) error {

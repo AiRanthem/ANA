@@ -435,11 +435,16 @@ func (m *managerFacade) DeletePlugin(ctx context.Context, id PluginID) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", opDeletePlugin, err)
 	}
-	if err := m.pluginStorage.Delete(ctx, row.ID); err != nil && !errors.Is(err, plugin.ErrStorageNotFound) {
-		return fmt.Errorf("%s: %w", opDeletePlugin, err)
-	}
 	if err := m.pluginRepository.Delete(ctx, row.ID); err != nil {
 		return fmt.Errorf("%s: %w", opDeletePlugin, err)
+	}
+	if err := m.pluginStorage.Delete(ctx, row.ID); err != nil && !errors.Is(err, plugin.ErrStorageNotFound) {
+		logs.FromContext(ctx).Warn("plugin blob delete failed after metadata delete",
+			"op", opDeletePlugin,
+			"component", "manager.plugin",
+			"plugin_id", row.ID,
+			"err", err,
+		)
 	}
 	return nil
 }
