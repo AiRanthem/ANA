@@ -130,7 +130,7 @@ func addManifestSectionPaths(add func(string), pluginBase string, entries map[st
 	for _, key := range keys {
 		entry := entries[key]
 		cleanPath := path.Clean(strings.TrimSpace(entry.Path))
-		if cleanPath == "." || cleanPath == "/" || strings.HasPrefix(cleanPath, "../") || path.IsAbs(cleanPath) {
+		if layoutPathUnsafe(cleanPath) {
 			continue
 		}
 		add(path.Join(pluginBase, cleanPath))
@@ -186,8 +186,27 @@ func buildWritePlan(pluginRoot fs.FS, pluginBase string) ([]writePlan, error) {
 	return planned, nil
 }
 
+func layoutPathUnsafe(cleanPath string) bool {
+	if cleanPath == "." || cleanPath == "/" || path.IsAbs(cleanPath) {
+		return true
+	}
+	if strings.HasPrefix(cleanPath, "../") {
+		return true
+	}
+	for _, seg := range strings.Split(cleanPath, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func mapPath(pluginBase, srcPath string) (string, error) {
 	clean := path.Clean(srcPath)
+	if layoutPathUnsafe(clean) {
+		return "", fmt.Errorf("%w: unsafe path %q", ErrInvalidPluginLayout, srcPath)
+	}
+
 	switch clean {
 	case manifestFile, "AGENTS.md", "README.md":
 		return path.Join(pluginBase, clean), nil

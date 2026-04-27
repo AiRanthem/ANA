@@ -3,6 +3,7 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -20,6 +21,9 @@ type MemoryStorage struct {
 	closed bool
 }
 
+// memoryStorageMaxPutBodyBytes matches the default zip payload cap (see OpenZipReaderFromStream).
+const memoryStorageMaxPutBodyBytes = int64(256 << 20)
+
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		blobs: make(map[PluginID]memoryBlob),
@@ -34,9 +38,13 @@ func (s *MemoryStorage) Put(_ context.Context, id PluginID, body io.Reader) (Sto
 	}
 	s.mu.RUnlock()
 
-	data, err := io.ReadAll(body)
+	limited := &io.LimitedReader{R: body, N: memoryStorageMaxPutBodyBytes + 1}
+	data, err := io.ReadAll(limited)
 	if err != nil {
 		return StoredObject{}, err
+	}
+	if int64(len(data)) > memoryStorageMaxPutBodyBytes {
+		return StoredObject{}, fmt.Errorf("%w: plugin body exceeds %d bytes", ErrCorruptArchive, memoryStorageMaxPutBodyBytes)
 	}
 	hash, size, err := Hash(bytes.NewReader(data))
 	if err != nil {

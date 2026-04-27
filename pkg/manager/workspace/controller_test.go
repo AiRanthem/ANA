@@ -381,6 +381,45 @@ func TestControllerSubmit_RetriesTransientRepoWrites(t *testing.T) {
 	}
 }
 
+// failHealthyCASRepo rejects UpdateStatusCAS(init→healthy); other transitions delegate to MemoryRepository.
+type failHealthyCASRepo struct {
+	*MemoryRepository
+}
+
+func (r *failHealthyCASRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
+	if writer == StatusWriterController && expect == StatusInit && next == StatusHealthy {
+		return errors.New("forced healthy CAS failure")
+	}
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
+}
+
+func TestControllerSubmit_HealthyCASFailureTransitionsFailed(t *testing.T) {
+	t.Parallel()
+
+	repo := &failHealthyCASRepo{MemoryRepository: NewMemoryRepository()}
+	h := newControllerHarness(t, controllerHarnessOptions{repo: repo})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_healthy_cas_fail", "healthy-cas-fail", StatusInit)
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	waitForWorkspaceStatus(t, h.repo, row.ID, StatusFailed, 2*time.Second)
+
+	got, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.StatusError == nil || got.StatusError.Phase != "status" {
+		t.Fatalf("StatusError = %+v, want Phase status", got.StatusError)
+	}
+	if got.StatusError.Code != "status.error" {
+		t.Fatalf("StatusError.Code = %q, want status.error", got.StatusError.Code)
+	}
+}
+
 func TestControllerDelete_MissingRowReturnsNotFound(t *testing.T) {
 	t.Parallel()
 

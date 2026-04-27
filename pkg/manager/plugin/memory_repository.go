@@ -224,24 +224,34 @@ func cloneManifestEntries(in map[string]ManifestEntry) map[string]ManifestEntry 
 }
 
 func cloneMapAny(in map[string]any) map[string]any {
+	return cloneMapAnyDepth(in, 0)
+}
+
+func cloneMapAnyDepth(in map[string]any, depth int) map[string]any {
+	if depth > maxMetadataNestingDepth {
+		return nil
+	}
 	if len(in) == 0 {
 		return nil
 	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
-		out[k] = deepCloneAny(v)
+		out[k] = deepCloneAnyDepth(v, depth+1)
 	}
 	return out
 }
 
-func deepCloneAny(v any) any {
+func deepCloneAnyDepth(v any, depth int) any {
+	if depth > maxMetadataNestingDepth {
+		return nil
+	}
 	switch x := v.(type) {
 	case map[string]any:
-		return cloneMapAny(x)
+		return cloneMapAnyDepth(x, depth)
 	case []any:
 		out := make([]any, len(x))
 		for i := range x {
-			out[i] = deepCloneAny(x[i])
+			out[i] = deepCloneAnyDepth(x[i], depth+1)
 		}
 		return out
 	default:

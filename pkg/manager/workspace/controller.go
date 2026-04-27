@@ -518,15 +518,9 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		}
 		return err
 	}); err != nil {
-		logs.FromContext(installCtx).Error("workspace healthy transition failed",
-			"component", "workspace_controller",
-			"workspace_id", latest.ID,
-			"workspace_alias", latest.Alias,
-			"namespace", latest.Namespace,
-			"agent_type", latest.AgentType,
-			"infra_type", latest.InfraType,
-			"phase", "status",
-			"err", err,
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID,
+			failureFromError(c.clock(), "status", fmt.Errorf("mark healthy after install: %w", err)),
+			time.Time{},
 		)
 	}
 }

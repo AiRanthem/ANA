@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"text/template"
 
 	"github.com/AiRanthem/ANA/pkg/manager/agent"
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
@@ -70,6 +71,64 @@ func TestInstall_FailsWhenBinaryUnavailable(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cmd.Args, []string{"--version"}) {
 		t.Fatalf("unexpected args: %v", cmd.Args)
+	}
+}
+
+func TestInstall_VerifyUsesProbeCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	spec, err := New(Options{ProbeArgs: []string{"--hello"}})
+	if err != nil {
+		t.Fatalf("new spec: %v", err)
+	}
+
+	ops := newFakeInfraOps()
+	ops.execFn = func(context.Context, infraops.ExecCommand) (infraops.ExecResult, error) {
+		return infraops.ExecResult{
+			ExitCode: 0,
+			Stdout:   []byte("1.2.3\n"),
+		}, nil
+	}
+
+	err = spec.Install(context.Background(), ops, agent.InstallParams{
+		Workspace: agent.WorkspaceSummary{
+			Alias:     "alpha",
+			Namespace: "default",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if len(ops.execCommands) != 1 {
+		t.Fatalf("exec calls = %d, want 1", len(ops.execCommands))
+	}
+	if !reflect.DeepEqual(ops.execCommands[0].Args, []string{"--hello"}) {
+		t.Fatalf("install verify args = %v, want [--hello]", ops.execCommands[0].Args)
+	}
+}
+
+func TestInstall_RejectsInvalidJSONFromSettingsTemplate(t *testing.T) {
+	t.Parallel()
+
+	tmpl := template.Must(template.New("cfg").Parse(`NOT_JSON {{.Workspace.Alias}}`))
+	spec, err := New(Options{SettingsTemplate: tmpl})
+	if err != nil {
+		t.Fatalf("new spec: %v", err)
+	}
+
+	ops := newFakeInfraOps()
+	ops.execFn = func(context.Context, infraops.ExecCommand) (infraops.ExecResult, error) {
+		return infraops.ExecResult{ExitCode: 0, Stdout: []byte("1.2.3\n")}, nil
+	}
+
+	err = spec.Install(context.Background(), ops, agent.InstallParams{
+		Workspace: agent.WorkspaceSummary{Alias: "alpha", Namespace: "default"},
+	})
+	if err == nil {
+		t.Fatal("Install() error = nil, want non-nil invalid JSON settings")
+	}
+	if ops.putCalls != 0 {
+		t.Fatalf("PutFile calls = %d, want 0 before settings rejected", ops.putCalls)
 	}
 }
 

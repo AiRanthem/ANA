@@ -25,13 +25,15 @@ import (
 )
 
 const (
-	typeLocalDir                 = infraops.InfraType("localdir")
-	defaultUmask                 = fs.FileMode(0o022)
-	defaultRequestLoopbackHost   = "127.0.0.1"
-	execOutputLimit              = 8 << 20
-	defaultRequestDialTimeout    = 30 * time.Second
-	defaultRequestIdleConnTimout = 30 * time.Second
-	getFileReadChunkSize         = 64 << 10 // GetFile read wrapper chunk size (PLAN)
+	typeLocalDir                        = infraops.InfraType("localdir")
+	defaultUmask                        = fs.FileMode(0o022)
+	defaultRequestLoopbackHost          = "127.0.0.1"
+	execOutputLimit                     = 8 << 20
+	defaultRequestDialTimeout           = 30 * time.Second
+	defaultRequestIdleConnTimout        = 30 * time.Second
+	defaultRequestOverallTimeout        = 90 * time.Second // bounds http.Client.Do for Request()
+	defaultRequestResponseHeaderTimeout = defaultRequestDialTimeout
+	getFileReadChunkSize                = 64 << 10 // GetFile read wrapper chunk size (PLAN)
 )
 
 // ErrInvalidDir is returned when the localdir "dir" option is invalid.
@@ -80,9 +82,12 @@ func New(ctx context.Context, opts infraops.Options) (infraops.InfraOps, error) 
 		Timeout: defaultRequestDialTimeout,
 	}
 	client := &http.Client{
+		Timeout: defaultRequestOverallTimeout,
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
+			// Loopback probing must not honor HTTP_PROXY; callers expect strict local routing.
+			Proxy:                 nil,
 			DialContext:           dialer.DialContext,
+			ResponseHeaderTimeout: defaultRequestResponseHeaderTimeout,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          64,
 			IdleConnTimeout:       defaultRequestIdleConnTimout,
@@ -378,19 +383,17 @@ func (o *ops) Init(ctx context.Context) error {
 	}
 
 	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
-		o.mu.Unlock()
 		return err
 	}
 	if o.cleared {
-		o.mu.Unlock()
 		return infraops.ErrCleared
 	}
 	if o.initialized {
-		o.mu.Unlock()
 		return infraops.ErrAlreadyInitialized
 	}
-	o.mu.Unlock()
 
 	parent := filepath.Dir(o.dir)
 	parentInfo, err := os.Stat(parent)
@@ -428,15 +431,20 @@ func (o *ops) Init(ctx context.Context) error {
 		return fmt.Errorf("localdir init stat dir %q: %w", o.dir, err)
 	}
 
+	empty, err := dirIsEmpty(o.dir)
+	if err != nil {
+		return fmt.Errorf("localdir init final empty check %q: %w", o.dir, err)
+	}
+	if !empty {
+		return fmt.Errorf("%w: %w: %s", infraops.ErrAlreadyInitialized, ErrDirNotEmpty, o.dir)
+	}
+
 	root, err := os.OpenRoot(o.dir)
 	if err != nil {
 		return fmt.Errorf("localdir init open root %q: %w", o.dir, err)
 	}
 
-	if err := o.setRoot(ctx, root); err != nil {
-		return err
-	}
-	return nil
+	return o.setRootLocked(ctx, root)
 }
 
 func (o *ops) Open(ctx context.Context) error {
@@ -445,19 +453,17 @@ func (o *ops) Open(ctx context.Context) error {
 	}
 
 	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
-		o.mu.Unlock()
 		return err
 	}
 	if o.cleared {
-		o.mu.Unlock()
 		return infraops.ErrCleared
 	}
 	if o.initialized {
-		o.mu.Unlock()
 		return nil
 	}
-	o.mu.Unlock()
 
 	info, err := os.Lstat(o.dir)
 	if err != nil {
@@ -477,13 +483,13 @@ func (o *ops) Open(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("localdir open root %q: %w", o.dir, err)
 	}
-	return o.setRoot(ctx, root)
+	return o.setRootLocked(ctx, root)
 }
 
-func (o *ops) setRoot(ctx context.Context, root *os.Root) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
+// setRootLocked installs root into o and marks the instance initialized.
+// The caller must hold o.mu for the duration of filesystem setup (Init/Open)
+// so Clear cannot run between mkdir/open and publishing the root handle.
+func (o *ops) setRootLocked(ctx context.Context, root *os.Root) error {
 	if err := o.waitCondWithContextLocked(ctx, func() bool { return o.clearing }); err != nil {
 		_ = root.Close()
 		return err
@@ -499,6 +505,12 @@ func (o *ops) setRoot(ctx context.Context, root *os.Root) error {
 	o.root = root
 	o.initialized = true
 	return nil
+}
+
+func (o *ops) setRoot(ctx context.Context, root *os.Root) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.setRootLocked(ctx, root)
 }
 
 func dirIsEmpty(dir string) (bool, error) {
@@ -862,7 +874,13 @@ func (o *ops) Clear(ctx context.Context) error {
 	}
 
 	o.mu.Lock()
-	if clearErr == nil {
+	if clearErr != nil {
+		if o.root != nil {
+			_ = o.root.Close()
+			o.root = nil
+		}
+		o.initialized = false
+	} else {
 		if o.root != nil {
 			_ = o.root.Close()
 		}
@@ -984,7 +1002,13 @@ func isPathOutsideRootLexical(path string) bool {
 }
 
 func isPathEscapeError(err error) bool {
-	return strings.Contains(err.Error(), "path escapes from parent")
+	for err != nil {
+		if strings.Contains(err.Error(), "path escapes from parent") {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 type ctxReadCloser struct {

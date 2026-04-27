@@ -571,6 +571,7 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 				"namespace", row.Namespace,
 				"err", deleteErr,
 			)
+			return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, errors.Join(err, deleteErr))
 		}
 		return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
 	}

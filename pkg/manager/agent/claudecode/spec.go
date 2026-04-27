@@ -116,7 +116,7 @@ func (s Spec) PluginLayout() agent.PluginLayout {
 
 // Install verifies the binary and writes deterministic workspace seed files.
 func (s Spec) Install(ctx context.Context, ops infraops.InfraOps, params agent.InstallParams) error {
-	if _, err := s.execVersion(ctx, ops, []string{"--version"}); err != nil {
+	if _, err := s.execVersion(ctx, ops, s.probeCommandArgs()); err != nil {
 		return fmt.Errorf("claudecode install verify binary: %w", err)
 	}
 
@@ -246,7 +246,11 @@ func (s Spec) renderSettings(workspace agent.WorkspaceSummary) ([]byte, error) {
 		if err := s.settingsTemplate.Execute(&buf, data); err != nil {
 			return nil, fmt.Errorf("execute settings template: %w", err)
 		}
-		return buf.Bytes(), nil
+		out := buf.Bytes()
+		if !json.Valid(out) {
+			return nil, fmt.Errorf("settings template produced invalid JSON")
+		}
+		return out, nil
 	}
 
 	cfg := struct {
