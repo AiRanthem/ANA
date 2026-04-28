@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -31,8 +32,11 @@ func (r *MemoryRepository) Insert(_ context.Context, p Plugin) error {
 	if r.closed {
 		return ErrStorageClosed
 	}
-	if _, exists := r.byID[p.ID]; exists {
-		return ErrPluginNameConflict
+	if existing, exists := r.byID[p.ID]; exists {
+		if existing.Namespace == p.Namespace && existing.Name == p.Name {
+			return errors.Join(ErrPluginIDConflict, ErrPluginNameConflict)
+		}
+		return ErrPluginIDConflict
 	}
 	nameKey := pluginNameKey(p.Namespace, p.Name)
 	if _, exists := r.idByNameKey[nameKey]; exists {

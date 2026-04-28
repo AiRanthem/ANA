@@ -426,6 +426,21 @@ func (s *ProbeScheduler) recordProbeOutcome(logCtx context.Context, row Workspac
 	}
 
 	updated := cloneWorkspace(row)
+	latest, err := s.repo.Get(persistCtx, row.ID)
+	if err != nil {
+		logs.FromContext(logCtx).Error("workspace probe metadata reload failed",
+			"component", "workspace_scheduler",
+			"workspace_id", row.ID,
+			"phase", "reload",
+			"err", err,
+		)
+		return
+	}
+	if latest.Status != newStatus {
+		return
+	}
+
+	updated = cloneWorkspace(latest)
 	updated.LastProbeAt = probedAt
 	updated.UpdatedAt = s.clock()
 	if newStatus == StatusHealthy {

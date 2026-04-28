@@ -155,9 +155,10 @@ avoid socket churn.
   cleared flag, the HTTP client) with a mutex; the underlying file
   system handles per-call atomicity.
 - Two `localdir` instances pointing at the same `dir` would race;
-  the manager refuses to register two workspaces with the same
-  `localdir.dir`. (This check happens at workspace-creation time,
-  not in this package.)
+  the manager canonicalizes `localdir.dir` with `filepath.Clean` and
+  refuses to register two workspaces with the same canonical path
+  (across namespaces and status values). This check happens at
+  workspace-creation time, not in this package.
 
 ## Safety
 

@@ -114,6 +114,7 @@ type PresignOptions struct {
 var (
 	ErrPluginNotFound     = errors.New("plugin: plugin not found")
 	ErrPluginNameConflict = errors.New("plugin: plugin name conflict")
+	ErrPluginIDConflict   = errors.New("plugin: plugin id conflict")
 	ErrInvalidManifest    = errors.New("plugin: invalid manifest")
 	ErrCorruptArchive     = errors.New("plugin: corrupt archive")
 	ErrStorageClosed      = errors.New("plugin: storage closed")

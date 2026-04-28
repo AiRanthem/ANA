@@ -121,6 +121,38 @@ func TestMemoryRepository_List_MaxIntLimitWithNonZeroCursorDoesNotPanic(t *testi
 	}
 }
 
+func TestMemoryRepository_InsertDuplicateIDReturnsIDConflict(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	now := time.Now().UTC()
+	base := Plugin{
+		ID:        "plg_dup_id",
+		Namespace: "default",
+		Name:      "alpha",
+		Manifest: Manifest{
+			SchemaVersion: 1,
+			Plugin:        ManifestPlugin{Name: "alpha"},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := repo.Insert(context.Background(), base); err != nil {
+		t.Fatalf("Insert(base) error = %v", err)
+	}
+
+	conflict := base
+	conflict.Name = "beta"
+	conflict.Manifest.Plugin.Name = "beta"
+	err := repo.Insert(context.Background(), conflict)
+	if !errors.Is(err, ErrPluginIDConflict) {
+		t.Fatalf("Insert(duplicate id) error = %v, want ErrPluginIDConflict", err)
+	}
+	if errors.Is(err, ErrPluginNameConflict) {
+		t.Fatalf("Insert(duplicate id) error = %v, want no ErrPluginNameConflict", err)
+	}
+}
+
 func TestMemoryStorage_PutGetDelete(t *testing.T) {
 	t.Parallel()
 

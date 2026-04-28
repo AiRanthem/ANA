@@ -461,6 +461,78 @@ func TestManagerCreateWorkspaceRejectsDuplicatePluginRefs(t *testing.T) {
 	}
 }
 
+func TestManagerCreateWorkspaceRejectsDuplicateLocaldirDir(t *testing.T) {
+	t.Parallel()
+
+	builder := NewBuilder()
+	builder.PluginRepository = plugin.NewMemoryRepository()
+	builder.PluginStorage = plugin.NewMemoryStorage()
+	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.IDGenerator = &sequenceIDGenerator{
+		pluginID: PluginID("plg_fixed"),
+		workspaceIDs: []WorkspaceID{
+			WorkspaceID("wsp_first"),
+			WorkspaceID("wsp_second"),
+		},
+	}
+	builder.InstallWorkers = 1
+	builder.ProbeInterval = time.Hour
+	builder.ProbeWorkers = 1
+	builder.ProbeTimeout = time.Second
+	builder.RegisterAgentSpec(&fakeAgentSpec{})
+	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
+
+	managerInstance, err := builder.Build(context.Background())
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if stopErr := managerInstance.Stop(context.Background()); stopErr != nil && !errors.Is(stopErr, ErrShutdown) {
+			t.Fatalf("Stop() error = %v", stopErr)
+		}
+	})
+
+	if err := managerInstance.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "shared")
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Alias:        Alias("Alice"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": dir},
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace(first) error = %v", err)
+	}
+
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Namespace:    Namespace("other"),
+		Alias:        Alias("Bob"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": filepath.Join(dir, ".")},
+	})
+	if err == nil {
+		t.Fatal("CreateWorkspace(second) error = nil, want non-nil")
+	}
+	if !errors.Is(err, ErrWorkspaceDirConflict) {
+		t.Fatalf("CreateWorkspace(second) error = %v, want ErrWorkspaceDirConflict", err)
+	}
+
+	rows, next, err := managerInstance.ListWorkspaces(context.Background(), ListWorkspacesOptions{})
+	if err != nil {
+		t.Fatalf("ListWorkspaces() error = %v", err)
+	}
+	if next != "" {
+		t.Fatalf("ListWorkspaces() next cursor = %q, want empty", next)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListWorkspaces() rows = %d, want 1", len(rows))
+	}
+}
+
 func TestNewInfraOps_RejectsEmptyDir(t *testing.T) {
 	t.Parallel()
 
@@ -544,11 +616,21 @@ func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing
 
 	<-pauseRepo.insertDone
 
-	if err := managerInstance.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() error = %v", err)
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- managerInstance.Stop(context.Background())
+	}()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned before in-flight API drained, err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Stop should wait for in-flight CreateWorkspace to complete.
 	}
 
 	close(pauseRepo.allowProceed)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
 	<-createDone
 
 	if createErr == nil {
@@ -756,6 +838,33 @@ type fixedIDGenerator struct {
 
 func (g fixedIDGenerator) PluginID() PluginID       { return g.nextPluginID }
 func (g fixedIDGenerator) WorkspaceID() WorkspaceID { return g.nextWorkspaceID }
+
+type sequenceIDGenerator struct {
+	pluginID     PluginID
+	workspaceIDs []WorkspaceID
+	mu           sync.Mutex
+	next         int
+}
+
+func (g *sequenceIDGenerator) PluginID() PluginID {
+	return g.pluginID
+}
+
+func (g *sequenceIDGenerator) WorkspaceID() WorkspaceID {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if len(g.workspaceIDs) == 0 {
+		return WorkspaceID("wsp_sequence")
+	}
+	if g.next >= len(g.workspaceIDs) {
+		return g.workspaceIDs[len(g.workspaceIDs)-1]
+	}
+
+	id := g.workspaceIDs[g.next]
+	g.next++
+	return id
+}
 
 func waitForWorkspaceStatus(t *testing.T, managerInstance Manager, id WorkspaceID, want WorkspaceStatus, timeout time.Duration) Workspace {
 	t.Helper()

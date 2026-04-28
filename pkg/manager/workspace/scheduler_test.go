@@ -625,3 +625,59 @@ func (r *blockingSchedulerUpdateRepo) Update(ctx context.Context, w Workspace) e
 	}
 	return r.MemoryRepository.Update(ctx, w)
 }
+
+func TestProbeScheduler_MetadataUpdatePreservesConcurrentDescription(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	probeStarted := make(chan struct{}, 1)
+	allowProbeReturn := make(chan struct{})
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		repo: repo,
+		probeFn: func(_ context.Context, _ infraops.InfraOps) (agent.ProbeResult, error) {
+			select {
+			case probeStarted <- struct{}{}:
+			default:
+			}
+			<-allowProbeReturn
+			return agent.ProbeResult{Healthy: true}, nil
+		},
+	})
+
+	row := h.insertWorkspace(t, "wsp_sched_meta", "sched-meta", StatusHealthy)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- h.scheduler.runTick(context.Background())
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not start")
+	}
+	current, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() before concurrent update error = %v", err)
+	}
+	current.Description = "new-description"
+	current.Labels = map[string]string{"owner": "scheduler-test"}
+	if err := h.repo.Update(context.Background(), current); err != nil {
+		t.Fatalf("concurrent Update() error = %v", err)
+	}
+	close(allowProbeReturn)
+	if err := <-runErr; err != nil {
+		t.Fatalf("runTick() error = %v", err)
+	}
+	got, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.Description != "new-description" {
+		t.Fatalf("Description = %q, want new-description", got.Description)
+	}
+	if got.Labels == nil || got.Labels["owner"] != "scheduler-test" {
+		t.Fatalf("Labels = %#v, want owner=scheduler-test", got.Labels)
+	}
+	if got.LastProbeAt.IsZero() {
+		t.Fatalf("LastProbeAt is zero, want non-zero")
+	}
+}

@@ -330,6 +330,10 @@ User → Manager.CreateWorkspace({
 
 1. Manager validates: namespace+alias unused, agent_type registered,
    infra_type registered, plugin ids exist in repo.
+   For `infra_type == "localdir"`, it additionally canonicalizes
+   `infra_options["dir"]` with `filepath.Clean` and rejects reuse of
+   the same canonical path by another workspace with
+   `ErrWorkspaceDirConflict`.
 2. Manager allocates WorkspaceID, persists Workspace{Status: init} to
    WorkspaceRepository in one transaction.
 3. Manager dispatches the install to a worker goroutine and returns the
@@ -695,9 +699,14 @@ type Factory func(ctx context.Context, opts Options) (InfraOps, error)
 
 Required option for every infra: `"dir"` — the absolute working
 directory. Implementations document additional keys in their own
-`PLAN.md`. The manager validates only that `dir` is non-empty before
-calling the factory; the factory validates everything else and returns
+`PLAN.md`; each factory validates option shape and values and returns
 typed errors.
+
+`CreateWorkspace` applies one cross-workspace policy before enqueueing
+install work: for `infra_type == "localdir"`, if `infra_options["dir"]`
+is a non-empty string, the manager canonicalizes it with
+`filepath.Clean` and rejects duplicates (`ErrWorkspaceDirConflict`) so
+two workspaces cannot share the same local runtime directory.
 
 The factory is invoked in three situations:
 
@@ -879,6 +888,9 @@ operators want a separate audit trail, they wrap the repositories.
   row; the install runs in a worker goroutine owned by the manager.
   Workers are tracked in a `sync.WaitGroup`; `Stop` blocks until all
   install workers and probe workers terminate.
+- `CreateWorkspace` serializes the localdir uniqueness check and row
+  insert so concurrent callers cannot race into duplicate
+  `localdir.dir` assignments.
 
 ### 10.2 Cancellation
 

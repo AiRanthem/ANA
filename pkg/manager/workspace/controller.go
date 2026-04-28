@@ -498,7 +498,14 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		return
 	}
 	if latest.Status != StatusInit {
-		// Snapshot expired (for example install watchdog moved init -> failed); do not promote status.
+		// Snapshot expired (for example install watchdog moved init -> failed).
+		// If the failure was an install timeout, preserve the directory for diagnosis.
+		if latest.Status == StatusFailed && latest.StatusError != nil && latest.StatusError.Code == "install.timeout" {
+			return
+		}
+		// Otherwise the install side effects already ran, so best-effort cleanup
+		// avoids leaving runtime state inconsistent with persisted status.
+		c.cleanupStaleInstallEffects(installCtx, latest, ops)
 		return
 	}
 
@@ -521,6 +528,21 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID,
 			failureFromError(c.clock(), "status", fmt.Errorf("mark healthy after install: %w", err)),
 			time.Time{},
+		)
+	}
+}
+
+func (c *Controller) cleanupStaleInstallEffects(ctx context.Context, row Workspace, ops infraops.InfraOps) {
+	if err := ops.Clear(ctx); err != nil {
+		logs.FromContext(ctx).Warn("workspace stale install cleanup failed",
+			"component", "workspace_controller",
+			"workspace_id", row.ID,
+			"workspace_alias", row.Alias,
+			"namespace", row.Namespace,
+			"agent_type", row.AgentType,
+			"infra_type", row.InfraType,
+			"phase", "clear_after_stale_install",
+			"err", err,
 		)
 	}
 }

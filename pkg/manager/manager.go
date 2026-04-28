@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -34,6 +35,8 @@ const (
 	opStart                  = "manager start"
 	opStop                   = "manager stop"
 	defaultPluginUploadLimit = int64(64 << 20)
+	localdirInfraType        = InfraType("localdir")
+	infraOptionDir           = "dir"
 )
 
 var errBuilderConsumed = errors.New("manager: builder already used")
@@ -239,14 +242,19 @@ type managerFacade struct {
 	mu             sync.RWMutex
 	stopInProgress bool
 	shutDown       bool
+	apiWg          sync.WaitGroup
+
+	createWorkspaceMu sync.Mutex
 }
 
 var _ Manager = (*managerFacade)(nil)
 
 func (m *managerFacade) CreatePlugin(ctx context.Context, req CreatePluginRequest) (Plugin, error) {
-	if err := m.ensureAvailable(opCreatePlugin); err != nil {
+	done, err := m.beginOp(opCreatePlugin)
+	if err != nil {
 		return Plugin{}, err
 	}
+	defer done()
 	if err := ctx.Err(); err != nil {
 		return Plugin{}, fmt.Errorf("%s: %w", opCreatePlugin, err)
 	}
@@ -368,9 +376,11 @@ func (m *managerFacade) CreatePlugin(ctx context.Context, req CreatePluginReques
 }
 
 func (m *managerFacade) GetPlugin(ctx context.Context, id PluginID) (Plugin, error) {
-	if err := m.ensureAvailable(opGetPlugin); err != nil {
+	done, err := m.beginOp(opGetPlugin)
+	if err != nil {
 		return Plugin{}, err
 	}
+	defer done()
 
 	row, err := m.pluginRepository.Get(ctx, plugin.PluginID(id))
 	if err != nil {
@@ -380,9 +390,11 @@ func (m *managerFacade) GetPlugin(ctx context.Context, id PluginID) (Plugin, err
 }
 
 func (m *managerFacade) GetPluginByName(ctx context.Context, namespace Namespace, name string) (Plugin, error) {
-	if err := m.ensureAvailable(opGetPluginByName); err != nil {
+	done, err := m.beginOp(opGetPluginByName)
+	if err != nil {
 		return Plugin{}, err
 	}
+	defer done()
 
 	namespace = normalizeNamespace(namespace)
 	if err := validateNamespace(namespace); err != nil {
@@ -397,9 +409,11 @@ func (m *managerFacade) GetPluginByName(ctx context.Context, namespace Namespace
 }
 
 func (m *managerFacade) ListPlugins(ctx context.Context, opts ListPluginsOptions) ([]Plugin, string, error) {
-	if err := m.ensureAvailable(opListPlugins); err != nil {
+	done, err := m.beginOp(opListPlugins)
+	if err != nil {
 		return nil, "", err
 	}
+	defer done()
 
 	namespace := opts.Namespace
 	if namespace != "" {
@@ -427,9 +441,11 @@ func (m *managerFacade) ListPlugins(ctx context.Context, opts ListPluginsOptions
 }
 
 func (m *managerFacade) DeletePlugin(ctx context.Context, id PluginID) error {
-	if err := m.ensureAvailable(opDeletePlugin); err != nil {
+	done, err := m.beginOp(opDeletePlugin)
+	if err != nil {
 		return err
 	}
+	defer done()
 
 	row, err := m.pluginRepository.Get(ctx, plugin.PluginID(id))
 	if err != nil {
@@ -450,9 +466,11 @@ func (m *managerFacade) DeletePlugin(ctx context.Context, id PluginID) error {
 }
 
 func (m *managerFacade) GetPluginDownloadURL(ctx context.Context, id PluginID, opts DownloadURLOptions) (string, error) {
-	if err := m.ensureAvailable(opGetPluginDownloadURL); err != nil {
+	done, err := m.beginOp(opGetPluginDownloadURL)
+	if err != nil {
 		return "", err
 	}
+	defer done()
 
 	if _, err := m.pluginRepository.Get(ctx, plugin.PluginID(id)); err != nil {
 		return "", fmt.Errorf("%s: %w", opGetPluginDownloadURL, err)
@@ -472,9 +490,11 @@ func (m *managerFacade) GetPluginDownloadURL(ctx context.Context, id PluginID, o
 }
 
 func (m *managerFacade) NewInfraOps(ctx context.Context, infraType InfraType, options infraops.Options) (infraops.InfraOps, error) {
-	if err := m.ensureAvailable(opNewInfraOps); err != nil {
+	done, err := m.beginOp(opNewInfraOps)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 
 	factory, ok := m.infraFactories.Get(infraops.InfraType(infraType))
 	if !ok {
@@ -498,9 +518,11 @@ func (m *managerFacade) InfraTypes() []InfraType {
 }
 
 func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspaceRequest) (Workspace, error) {
-	if err := m.ensureAvailable(opCreateWorkspace); err != nil {
+	done, err := m.beginOp(opCreateWorkspace)
+	if err != nil {
 		return Workspace{}, err
 	}
+	defer done()
 	if err := ctx.Err(); err != nil {
 		return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
 	}
@@ -521,6 +543,13 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 	}
 	if _, ok := m.infraFactories.Get(infraops.InfraType(req.InfraType)); !ok {
 		return Workspace{}, fmt.Errorf("%s: %w: %q", opCreateWorkspace, ErrInfraTypeUnknown, req.InfraType)
+	}
+
+	m.createWorkspaceMu.Lock()
+	defer m.createWorkspaceMu.Unlock()
+
+	if err := m.ensureWorkspaceInfraUniqueness(ctx, req); err != nil {
+		return Workspace{}, fmt.Errorf("%s: %w", opCreateWorkspace, err)
 	}
 
 	attached, refs, err := m.resolveAttachedPlugins(ctx, req.Plugins)
@@ -580,9 +609,11 @@ func (m *managerFacade) CreateWorkspace(ctx context.Context, req CreateWorkspace
 }
 
 func (m *managerFacade) GetWorkspace(ctx context.Context, id WorkspaceID) (Workspace, error) {
-	if err := m.ensureAvailable(opGetWorkspace); err != nil {
+	done, err := m.beginOp(opGetWorkspace)
+	if err != nil {
 		return Workspace{}, err
 	}
+	defer done()
 
 	row, err := m.workspaceRepository.Get(ctx, workspace.WorkspaceID(id))
 	if err != nil {
@@ -592,9 +623,11 @@ func (m *managerFacade) GetWorkspace(ctx context.Context, id WorkspaceID) (Works
 }
 
 func (m *managerFacade) GetWorkspaceByAlias(ctx context.Context, namespace Namespace, alias Alias) (Workspace, error) {
-	if err := m.ensureAvailable(opGetWorkspaceByAlias); err != nil {
+	done, err := m.beginOp(opGetWorkspaceByAlias)
+	if err != nil {
 		return Workspace{}, err
 	}
+	defer done()
 
 	namespace = normalizeNamespace(namespace)
 	if err := validateNamespace(namespace); err != nil {
@@ -612,9 +645,11 @@ func (m *managerFacade) GetWorkspaceByAlias(ctx context.Context, namespace Names
 }
 
 func (m *managerFacade) ListWorkspaces(ctx context.Context, opts ListWorkspacesOptions) ([]Workspace, string, error) {
-	if err := m.ensureAvailable(opListWorkspaces); err != nil {
+	done, err := m.beginOp(opListWorkspaces)
+	if err != nil {
 		return nil, "", err
 	}
+	defer done()
 
 	namespace := opts.Namespace
 	if namespace != "" {
@@ -645,9 +680,11 @@ func (m *managerFacade) ListWorkspaces(ctx context.Context, opts ListWorkspacesO
 }
 
 func (m *managerFacade) DeleteWorkspace(ctx context.Context, id WorkspaceID) error {
-	if err := m.ensureAvailable(opDeleteWorkspace); err != nil {
+	done, err := m.beginOp(opDeleteWorkspace)
+	if err != nil {
 		return err
 	}
+	defer done()
 	if err := m.controller.Delete(ctx, workspace.WorkspaceID(id)); err != nil {
 		return fmt.Errorf("%s: %w", opDeleteWorkspace, err)
 	}
@@ -667,9 +704,12 @@ func (m *managerFacade) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
-	if err := m.ensureAvailable(opStart); err != nil {
-		return err
+	m.mu.RLock()
+	if m.shutDown || m.stopInProgress {
+		m.mu.RUnlock()
+		return fmt.Errorf("%s: %w", opStart, ErrShutdown)
 	}
+	m.mu.RUnlock()
 	if err := m.controller.Start(m.buildCtx); err != nil {
 		return fmt.Errorf("%s: %w", opStart, err)
 	}
@@ -702,17 +742,24 @@ func (m *managerFacade) Stop(ctx context.Context) error {
 	m.stopInProgress = true
 	m.mu.Unlock()
 
+	var errs []error
 	if err := m.scheduler.Stop(ctx); err != nil {
-		m.mu.Lock()
-		m.stopInProgress = false
-		m.mu.Unlock()
-		return fmt.Errorf("%s: %w", opStop, err)
+		errs = append(errs, fmt.Errorf("scheduler stop: %w", err))
 	}
 	if err := m.controller.Stop(ctx); err != nil {
-		m.mu.Lock()
-		m.stopInProgress = false
-		m.mu.Unlock()
-		return fmt.Errorf("%s: %w", opStop, err)
+		errs = append(errs, fmt.Errorf("controller stop: %w", err))
+	}
+
+	waitCh := make(chan struct{})
+	go func() {
+		m.apiWg.Wait()
+		close(waitCh)
+	}()
+
+	select {
+	case <-waitCh:
+	case <-ctx.Done():
+		errs = append(errs, fmt.Errorf("api drain: %w", ctx.Err()))
 	}
 
 	m.closeQuietly(ctx, opStop, m.workspaceRepository.Close)
@@ -720,9 +767,11 @@ func (m *managerFacade) Stop(ctx context.Context) error {
 	m.closeQuietly(ctx, opStop, m.pluginStorage.Close)
 
 	m.mu.Lock()
-	m.stopInProgress = false
 	m.shutDown = true
 	m.mu.Unlock()
+	if len(errs) > 0 {
+		return fmt.Errorf("%s: %w", opStop, errors.Join(errs...))
+	}
 	return nil
 }
 
@@ -761,13 +810,64 @@ func (m *managerFacade) resolveAttachedPlugins(ctx context.Context, refs []Plugi
 	return attached, installRefs, nil
 }
 
-func (m *managerFacade) ensureAvailable(op string) error {
+func (m *managerFacade) ensureWorkspaceInfraUniqueness(ctx context.Context, req CreateWorkspaceRequest) error {
+	if req.InfraType != localdirInfraType {
+		return nil
+	}
+
+	wantDir, ok := localdirDirOption(req.InfraOptions)
+	if !ok {
+		// Keep option-shape validation in the infra factory.
+		return nil
+	}
+
+	cursor := ""
+	for {
+		rows, next, err := m.workspaceRepository.List(ctx, workspace.ListOptions{
+			InfraType: workspace.InfraType(req.InfraType),
+			Limit:     200,
+			Cursor:    cursor,
+		})
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			existingDir, ok := localdirDirOption(row.InfraOptions)
+			if !ok {
+				continue
+			}
+			if existingDir != wantDir {
+				continue
+			}
+			return fmt.Errorf("%w: %q already used by workspace %q", ErrWorkspaceDirConflict, wantDir, row.ID)
+		}
+		if next == "" {
+			return nil
+		}
+		cursor = next
+	}
+}
+
+func localdirDirOption(options infraops.Options) (string, bool) {
+	raw, ok := options[infraOptionDir]
+	if !ok {
+		return "", false
+	}
+	dir, ok := raw.(string)
+	if !ok || dir == "" {
+		return "", false
+	}
+	return filepath.Clean(dir), true
+}
+
+func (m *managerFacade) beginOp(op string) (func(), error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.shutDown || m.stopInProgress {
-		return fmt.Errorf("%s: %w", op, ErrShutdown)
+		return nil, fmt.Errorf("%s: %w", op, ErrShutdown)
 	}
-	return nil
+	m.apiWg.Add(1)
+	return m.apiWg.Done, nil
 }
 
 func (m *managerFacade) closeQuietly(ctx context.Context, op string, closeFn func(context.Context) error) {

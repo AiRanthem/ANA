@@ -1200,6 +1200,62 @@ func TestController_DoesNotPromoteFailedToHealthyAfterInitTimeoutRace(t *testing
 	}
 }
 
+func TestController_PreservesInfraWhenInstallTimesOutAfterStatusRace(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	installStarted := make(chan struct{}, 1)
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case installStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_stale_cleanup", "stale-cleanup", StatusInit)
+	state := h.registry.stateFor(string(row.ID))
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	select {
+	case <-installStarted:
+	case <-time.After(time.Second):
+		t.Fatal("install did not start")
+	}
+
+	if err := h.repo.UpdateStatusCAS(
+		context.Background(),
+		row.ID,
+		StatusWriterScheduler,
+		StatusInit,
+		StatusFailed,
+		failureFromError(time.Now().UTC(), "install", ErrInstallTimeout),
+		time.Time{},
+	); err != nil {
+		t.Fatalf("UpdateStatusCAS(init->failed) error = %v", err)
+	}
+	close(release)
+
+	waitForWorkspaceStatus(t, h.repo, row.ID, StatusFailed, 2*time.Second)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if state.clearCalls.Load() != 0 {
+			t.Fatalf("Clear() calls = %d, want 0 on install.timeout status race", state.clearCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestController_PersistAttachedPluginsPreservesConcurrentMetadataUpdate(t *testing.T) {
 	t.Parallel()
 

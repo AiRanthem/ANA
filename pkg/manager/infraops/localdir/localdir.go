@@ -378,6 +378,7 @@ func (o *ops) waitCondWithContextLocked(ctx context.Context, pred func() bool) e
 }
 
 func (o *ops) Init(ctx context.Context) error {
+	ctx = ensureContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -448,6 +449,7 @@ func (o *ops) Init(ctx context.Context) error {
 }
 
 func (o *ops) Open(ctx context.Context) error {
+	ctx = ensureContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -522,6 +524,7 @@ func dirIsEmpty(dir string) (bool, error) {
 }
 
 func (o *ops) Exec(ctx context.Context, cmd infraops.ExecCommand) (infraops.ExecResult, error) {
+	ctx = ensureContext(ctx)
 	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return infraops.ExecResult{}, err
@@ -655,6 +658,7 @@ func (o *ops) resolveExecDir(root *os.Root, workDir string) (dir string, hold *o
 }
 
 func (o *ops) PutFile(ctx context.Context, path string, content io.Reader, mode fs.FileMode) error {
+	ctx = ensureContext(ctx)
 	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return err
@@ -749,6 +753,7 @@ func (o *ops) tempSiblingPath(path string) string {
 }
 
 func (o *ops) GetFile(ctx context.Context, path string) (io.ReadCloser, error) {
+	ctx = ensureContext(ctx)
 	root, release, err := o.beginOp(ctx)
 	if err != nil {
 		return nil, err
@@ -784,6 +789,7 @@ func (o *ops) GetFile(ctx context.Context, path string) (io.ReadCloser, error) {
 }
 
 func (o *ops) Request(ctx context.Context, port int, req *http.Request) (*http.Response, error) {
+	ctx = ensureContext(ctx)
 	_, release, err := o.beginOp(ctx)
 	if err != nil {
 		return nil, err
@@ -812,6 +818,7 @@ func (o *ops) Request(ctx context.Context, port int, req *http.Request) (*http.R
 }
 
 func (o *ops) Clear(ctx context.Context) error {
+	ctx = ensureContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -957,6 +964,7 @@ func clearRootContents(ctx context.Context, root *os.Root) error {
 }
 
 func (o *ops) beginOp(ctx context.Context) (*os.Root, func(), error) {
+	ctx = ensureContext(ctx)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -1046,6 +1054,13 @@ func (r *ctxReadCloser) Read(p []byte) (int, error) {
 
 func (r *ctxReadCloser) Close() error {
 	return r.rc.Close()
+}
+
+func ensureContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 type cappedBuffer struct {

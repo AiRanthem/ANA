@@ -2,6 +2,8 @@ package claudecode
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -309,7 +311,14 @@ func sanitizePluginName(name string) string {
 
 	clean := strings.Trim(b.String(), "-")
 	if len(clean) > 64 {
-		clean = strings.Trim(clean[:64], "-")
+		sum := sha256.Sum256([]byte(clean))
+		suffix := hex.EncodeToString(sum[:4])
+		const maxPrefix = 64 - 1 - 8 // "-" + 8 hex chars
+		prefix := strings.Trim(clean[:maxPrefix], "-")
+		if prefix == "" {
+			prefix = "plugin"
+		}
+		clean = prefix + "-" + suffix
 	}
 	return clean
 }
