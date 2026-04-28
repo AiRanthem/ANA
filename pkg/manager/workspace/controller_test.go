@@ -381,6 +381,45 @@ func TestControllerSubmit_RetriesTransientRepoWrites(t *testing.T) {
 	}
 }
 
+// failHealthyCASRepo rejects UpdateStatusCAS(init→healthy); other transitions delegate to MemoryRepository.
+type failHealthyCASRepo struct {
+	*MemoryRepository
+}
+
+func (r *failHealthyCASRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
+	if writer == StatusWriterController && expect == StatusInit && next == StatusHealthy {
+		return errors.New("forced healthy CAS failure")
+	}
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
+}
+
+func TestControllerSubmit_HealthyCASFailureTransitionsFailed(t *testing.T) {
+	t.Parallel()
+
+	repo := &failHealthyCASRepo{MemoryRepository: NewMemoryRepository()}
+	h := newControllerHarness(t, controllerHarnessOptions{repo: repo})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_healthy_cas_fail", "healthy-cas-fail", StatusInit)
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	waitForWorkspaceStatus(t, h.repo, row.ID, StatusFailed, 2*time.Second)
+
+	got, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.StatusError == nil || got.StatusError.Phase != "status" {
+		t.Fatalf("StatusError = %+v, want Phase status", got.StatusError)
+	}
+	if got.StatusError.Code != "status.error" {
+		t.Fatalf("StatusError.Code = %q, want status.error", got.StatusError.Code)
+	}
+}
+
 func TestControllerDelete_MissingRowReturnsNotFound(t *testing.T) {
 	t.Parallel()
 
@@ -451,6 +490,171 @@ func TestControllerDeleteContinuesToClearWhenOpenFails(t *testing.T) {
 	if st.clearCalls.Load() != 1 {
 		t.Fatalf("Clear() calls = %d, want 1", st.clearCalls.Load())
 	}
+	if _, err := h.repo.Get(context.Background(), row.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("Get() after Delete error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+func TestControllerStop_DoesNotHangWhenFailedStatusPersistBlocks(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemoryRepository()
+	block := &blockingControllerUpdateStatusCASRepo{
+		MemoryRepository: mem,
+		signal:           make(chan struct{}, 1),
+	}
+	h := newControllerHarness(t, controllerHarnessOptions{repo: block})
+	defer h.stop(t)
+
+	now := time.Now().UTC()
+	row := h.insertWorkspaceRaw(t, Workspace{
+		ID:           "wsp_block_failed",
+		Namespace:    "default",
+		Alias:        "block-failed",
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("missing-infra"),
+		InfraOptions: infraops.Options{"dir": "wsp_block_failed"},
+		Plugins: []AttachedPlugin{
+			{PluginID: PluginID("plg_1"), Name: "demo-plugin", ContentHash: h.pluginObj.ContentHash},
+		},
+		Status:    StatusInit,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	block.blockID = row.ID
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	select {
+	case <-block.signal:
+	case <-time.After(3 * time.Second):
+		t.Fatal("UpdateStatusCAS did not block")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	stopErr := h.controller.Stop(stopCtx)
+	cancel()
+	if errors.Is(stopErr, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+func TestControllerDelete_MissingFactoryStillDeletesRow(t *testing.T) {
+	t.Parallel()
+
+	h := newControllerHarness(t, controllerHarnessOptions{})
+	defer h.stop(t)
+
+	now := time.Now().UTC()
+	row := h.insertWorkspaceRaw(t, Workspace{
+		ID:           "wsp_miss_fac",
+		Namespace:    "default",
+		Alias:        "miss-fac",
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("missing-infra"),
+		InfraOptions: infraops.Options{"dir": "wsp_miss_fac"},
+		Plugins: []AttachedPlugin{
+			{PluginID: PluginID("plg_1"), Name: "demo-plugin", ContentHash: h.pluginObj.ContentHash},
+		},
+		Status:    StatusHealthy,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+
+	if err := h.controller.Delete(context.Background(), row.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := h.repo.Get(context.Background(), row.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("Get() after Delete error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+func TestControllerDelete_FactoryBuildErrorStillDeletesRow(t *testing.T) {
+	t.Parallel()
+
+	h := newControllerHarness(t, controllerHarnessOptions{})
+	defer h.stop(t)
+
+	now := time.Now().UTC()
+	row := h.insertWorkspaceRaw(t, Workspace{
+		ID:           "wsp_bad_opts",
+		Namespace:    "default",
+		Alias:        "bad-opts",
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{},
+		Plugins: []AttachedPlugin{
+			{PluginID: PluginID("plg_1"), Name: "demo-plugin", ContentHash: h.pluginObj.ContentHash},
+		},
+		Status:    StatusHealthy,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+
+	if err := h.controller.Delete(context.Background(), row.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := h.repo.Get(context.Background(), row.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("Get() after Delete error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+func TestControllerDelete_MissingAgentSpecStillDeletesRow(t *testing.T) {
+	t.Parallel()
+
+	h := newControllerHarness(t, controllerHarnessOptions{})
+	defer h.stop(t)
+
+	now := time.Now().UTC()
+	row := h.insertWorkspaceRaw(t, Workspace{
+		ID:           "wsp_miss_spec",
+		Namespace:    "default",
+		Alias:        "miss-spec",
+		AgentType:    AgentType("missing-agent-type"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": "wsp_miss_spec"},
+		Plugins: []AttachedPlugin{
+			{PluginID: PluginID("plg_1"), Name: "demo-plugin", ContentHash: h.pluginObj.ContentHash},
+		},
+		Status:    StatusHealthy,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	st := h.registry.stateFor(string(row.ID))
+
+	if err := h.controller.Delete(context.Background(), row.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if st.clearCalls.Load() != 1 {
+		t.Fatalf("Clear() calls = %d, want 1", st.clearCalls.Load())
+	}
+	if _, err := h.repo.Get(context.Background(), row.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+		t.Fatalf("Get() after Delete error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+// blockingControllerUpdateStatusCASRepo blocks on failed-status CAS matching FIXV2 harness rules.
+type blockingControllerUpdateStatusCASRepo struct {
+	*MemoryRepository
+	signal  chan struct{}
+	blockID WorkspaceID
+}
+
+func (r *blockingControllerUpdateStatusCASRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
+	if writer == StatusWriterController && expect == StatusInit && next == StatusFailed && id == r.blockID {
+		select {
+		case r.signal <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
 }
 
 func TestControllerSubmitPluginHashMismatchFailsBeforeApply(t *testing.T) {
@@ -490,6 +694,8 @@ type controllerHarnessOptions struct {
 	flakyRepo      bool
 	// sharedRepo, when set, is used as the backing store (e.g. with a scheduler sharing the same repo).
 	sharedRepo *MemoryRepository
+	// repo, when non-nil, is used as the controller repository (e.g. blocking wrappers). Mutually exclusive with flakyRepo and sharedRepo.
+	repo Repository
 }
 
 type controllerHarness struct {
@@ -548,15 +754,30 @@ func newControllerHarness(t *testing.T, opts controllerHarnessOptions) *controll
 	storage := plugin.NewMemoryStorage()
 	obj := seedPluginZip(t, storage, plugin.PluginID("plg_1"), "demo-plugin")
 
-	baseRepo := opts.sharedRepo
-	if baseRepo == nil {
+	if opts.repo != nil && opts.flakyRepo {
+		t.Fatal("controllerHarnessOptions: repo and flakyRepo are mutually exclusive")
+	}
+	if opts.repo != nil && opts.sharedRepo != nil {
+		t.Fatal("controllerHarnessOptions: repo and sharedRepo are mutually exclusive")
+	}
+
+	var baseRepo *MemoryRepository
+	if opts.sharedRepo != nil {
+		baseRepo = opts.sharedRepo
+	} else if opts.repo == nil {
 		baseRepo = NewMemoryRepository()
 	}
-	var repo Repository = baseRepo
+
+	var repo Repository
 	var flaky *flakyRepo
-	if opts.flakyRepo {
+	switch {
+	case opts.repo != nil:
+		repo = opts.repo
+	case opts.flakyRepo:
 		flaky = &flakyRepo{MemoryRepository: baseRepo}
 		repo = flaky
+	default:
+		repo = baseRepo
 	}
 
 	controller, err := NewController(ControllerConfig{
@@ -615,6 +836,15 @@ func (h *controllerHarness) insertWorkspace(t *testing.T, id WorkspaceID, alias 
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
+	if err := h.repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+	return row
+}
+
+// insertWorkspaceRaw inserts an arbitrary workspace row (for cases where Update cannot change immutable identity fields).
+func (h *controllerHarness) insertWorkspaceRaw(t *testing.T, row Workspace) Workspace {
+	t.Helper()
 	if err := h.repo.Insert(context.Background(), row); err != nil {
 		t.Fatalf("Insert() error = %v", err)
 	}
@@ -915,15 +1145,22 @@ func TestController_DoesNotPromoteFailedToHealthyAfterInitTimeoutRace(t *testing
 		t.Fatalf("NewProbeScheduler() error = %v", err)
 	}
 
-	row := h.insertWorkspace(t, "wsp_init_race", "init-race", StatusInit)
-	cur, err := repo.Get(context.Background(), row.ID)
-	if err != nil {
-		t.Fatalf("Get() error = %v", err)
+	row := Workspace{
+		ID:           "wsp_init_race",
+		Namespace:    "default",
+		Alias:        "init-race",
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": "wsp_init_race"},
+		Plugins: []AttachedPlugin{
+			{PluginID: PluginID("plg_1"), Name: "demo-plugin", ContentHash: h.pluginObj.ContentHash},
+		},
+		Status:    StatusInit,
+		CreatedAt: now.Add(-2 * time.Minute),
+		UpdatedAt: now.Add(-2 * time.Minute),
 	}
-	cur.CreatedAt = now.Add(-2 * time.Minute)
-	cur.UpdatedAt = now.Add(-2 * time.Minute)
-	if err := repo.Update(context.Background(), cur); err != nil {
-		t.Fatalf("Update() backdate CreatedAt: %v", err)
+	if err := repo.Insert(context.Background(), row); err != nil {
+		t.Fatalf("Insert() error = %v", err)
 	}
 
 	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
@@ -960,6 +1197,62 @@ func TestController_DoesNotPromoteFailedToHealthyAfterInitTimeoutRace(t *testing
 	}
 	if final.Status != StatusFailed {
 		t.Fatalf("final status = %q, want failed", final.Status)
+	}
+}
+
+func TestController_PreservesInfraWhenInstallTimesOutAfterStatusRace(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	installStarted := make(chan struct{}, 1)
+	h := newControllerHarness(t, controllerHarnessOptions{
+		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
+			select {
+			case installStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	defer h.stop(t)
+
+	row := h.insertWorkspace(t, "wsp_stale_cleanup", "stale-cleanup", StatusInit)
+	state := h.registry.stateFor(string(row.ID))
+
+	if err := h.controller.Submit(context.Background(), row, installParamsFor(row)); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	select {
+	case <-installStarted:
+	case <-time.After(time.Second):
+		t.Fatal("install did not start")
+	}
+
+	if err := h.repo.UpdateStatusCAS(
+		context.Background(),
+		row.ID,
+		StatusWriterScheduler,
+		StatusInit,
+		StatusFailed,
+		failureFromError(time.Now().UTC(), "install", ErrInstallTimeout),
+		time.Time{},
+	); err != nil {
+		t.Fatalf("UpdateStatusCAS(init->failed) error = %v", err)
+	}
+	close(release)
+
+	waitForWorkspaceStatus(t, h.repo, row.ID, StatusFailed, 2*time.Second)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if state.clearCalls.Load() != 0 {
+			t.Fatalf("Clear() calls = %d, want 0 on install.timeout status race", state.clearCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

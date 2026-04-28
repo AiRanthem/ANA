@@ -251,11 +251,12 @@ type schedulerHarnessOptions struct {
 	timeout        time.Duration
 	installTimeout time.Duration
 	probeFn        func(context.Context, infraops.InfraOps) (agent.ProbeResult, error)
+	repo           Repository
 }
 
 type schedulerHarness struct {
 	scheduler *ProbeScheduler
-	repo      *MemoryRepository
+	repo      Repository
 	spec      *fakeAgentSpec
 	registry  *fakeInfraRegistry
 }
@@ -278,7 +279,10 @@ func newSchedulerHarness(t *testing.T, opts schedulerHarnessOptions) *schedulerH
 		t.Fatalf("Register(factory) error = %v", err)
 	}
 
-	repo := NewMemoryRepository()
+	var repo Repository = NewMemoryRepository()
+	if opts.repo != nil {
+		repo = opts.repo
+	}
 	scheduler, err := NewProbeScheduler(ProbeSchedulerConfig{
 		Repo:           repo,
 		AgentSpecs:     specSet,
@@ -499,5 +503,181 @@ func TestProbeScheduler_ProbeTransitionCASConflictIsHandled(t *testing.T) {
 	}
 	if got2.Status != StatusFailed {
 		t.Fatalf("after second tick status = %q, want failed", got2.Status)
+	}
+}
+
+func TestProbeSchedulerStop_DoesNotHangWhenWatchdogStatusWriteBlocks(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+	mem := NewMemoryRepository()
+	block := &blockingSchedulerUpdateStatusCASRepo{
+		MemoryRepository: mem,
+		signal:           make(chan struct{}, 1),
+	}
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		interval:       10 * time.Millisecond,
+		installTimeout: 30 * time.Second,
+		clock:          func() time.Time { return now },
+		repo:           block,
+		timeout:        5 * time.Second,
+	})
+
+	row := h.insertWorkspaceAt(t, "wsp_block_wd", "block-wd", StatusInit, now.Add(-2*time.Minute))
+	block.blockID = row.ID
+
+	if err := h.scheduler.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-block.signal:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watchdog UpdateStatusCAS did not block")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	stopErr := h.scheduler.Stop(stopCtx)
+	cancel()
+	if errors.Is(stopErr, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+func TestProbeSchedulerStop_DoesNotHangWhenMetadataUpdateBlocks(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+	mem := NewMemoryRepository()
+	block := &blockingSchedulerUpdateRepo{
+		MemoryRepository: mem,
+		signal:           make(chan struct{}, 1),
+	}
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		interval: 10 * time.Millisecond,
+		clock:    func() time.Time { return now },
+		probeFn: func(_ context.Context, _ infraops.InfraOps) (agent.ProbeResult, error) {
+			return agent.ProbeResult{Healthy: true}, nil
+		},
+		repo:    block,
+		timeout: 5 * time.Second,
+	})
+
+	row := h.insertWorkspaceAt(t, "wsp_block_meta", "block-meta", StatusHealthy, now)
+	block.blockID = row.ID
+
+	if err := h.scheduler.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-block.signal:
+	case <-time.After(3 * time.Second):
+		t.Fatal("metadata Update did not block")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	stopErr := h.scheduler.Stop(stopCtx)
+	cancel()
+	if errors.Is(stopErr, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+type blockingSchedulerUpdateStatusCASRepo struct {
+	*MemoryRepository
+	signal  chan struct{}
+	blockID WorkspaceID
+}
+
+func (r *blockingSchedulerUpdateStatusCASRepo) UpdateStatusCAS(ctx context.Context, id WorkspaceID, writer StatusWriter, expect Status, next Status, statusErr *Error, lastProbeAt time.Time) error {
+	if writer == StatusWriterScheduler && expect == StatusInit && next == StatusFailed && id == r.blockID {
+		select {
+		case r.signal <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return r.MemoryRepository.UpdateStatusCAS(ctx, id, writer, expect, next, statusErr, lastProbeAt)
+}
+
+type blockingSchedulerUpdateRepo struct {
+	*MemoryRepository
+	signal  chan struct{}
+	blockID WorkspaceID
+}
+
+func (r *blockingSchedulerUpdateRepo) Update(ctx context.Context, w Workspace) error {
+	if w.ID == r.blockID {
+		select {
+		case r.signal <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return r.MemoryRepository.Update(ctx, w)
+}
+
+func TestProbeScheduler_MetadataUpdatePreservesConcurrentDescription(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	probeStarted := make(chan struct{}, 1)
+	allowProbeReturn := make(chan struct{})
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		repo: repo,
+		probeFn: func(_ context.Context, _ infraops.InfraOps) (agent.ProbeResult, error) {
+			select {
+			case probeStarted <- struct{}{}:
+			default:
+			}
+			<-allowProbeReturn
+			return agent.ProbeResult{Healthy: true}, nil
+		},
+	})
+
+	row := h.insertWorkspace(t, "wsp_sched_meta", "sched-meta", StatusHealthy)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- h.scheduler.runTick(context.Background())
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not start")
+	}
+	current, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() before concurrent update error = %v", err)
+	}
+	current.Description = "new-description"
+	current.Labels = map[string]string{"owner": "scheduler-test"}
+	if err := h.repo.Update(context.Background(), current); err != nil {
+		t.Fatalf("concurrent Update() error = %v", err)
+	}
+	close(allowProbeReturn)
+	if err := <-runErr; err != nil {
+		t.Fatalf("runTick() error = %v", err)
+	}
+	got, err := h.repo.Get(context.Background(), row.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.Description != "new-description" {
+		t.Fatalf("Description = %q, want new-description", got.Description)
+	}
+	if got.Labels == nil || got.Labels["owner"] != "scheduler-test" {
+		t.Fatalf("Labels = %#v, want owner=scheduler-test", got.Labels)
+	}
+	if got.LastProbeAt.IsZero() {
+		t.Fatalf("LastProbeAt is zero, want non-zero")
 	}
 }

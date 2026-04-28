@@ -12,6 +12,12 @@ import (
 
 const manifestSchemaV1 = 1
 
+// Limits for free-form plugin.metadata (DoS hardening).
+const (
+	maxMetadataNestingDepth = 32
+	maxMetadataWalkNodes    = 4096
+)
+
 var pluginNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
 
 // ParseManifest decodes manifest.toml bytes and validates schema-v1 rules.
@@ -39,7 +45,7 @@ func ValidateManifest(m Manifest) error {
 	if len(m.Plugin.Description) > 1024 {
 		errs = append(errs, errors.New("plugin.description exceeds 1024 chars"))
 	}
-	if err := validateMetadata(m.Plugin.Metadata, "plugin.metadata"); err != nil {
+	if err := validateMetadataBounded(m.Plugin.Metadata, "plugin.metadata"); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -70,19 +76,31 @@ func ValidateManifest(m Manifest) error {
 	return nil
 }
 
-func validateMetadata(meta map[string]any, prefix string) error {
+func validateMetadataBounded(meta map[string]any, prefix string) error {
+	budget := maxMetadataWalkNodes
+	return walkMetadata(meta, prefix, 0, &budget)
+}
+
+func walkMetadata(meta map[string]any, prefix string, depth int, budget *int) error {
+	if depth > maxMetadataNestingDepth {
+		return fmt.Errorf("%w: plugin.metadata exceeds %d nesting levels", ErrInvalidManifest, maxMetadataNestingDepth)
+	}
 	for key, value := range meta {
 		if strings.TrimSpace(key) == "" {
 			return fmt.Errorf("%s has an empty key", prefix)
 		}
-		if err := validateMetadataValue(value, prefix+"."+key); err != nil {
+		if *budget <= 0 {
+			return fmt.Errorf("%w: plugin.metadata exceeds %d nodes", ErrInvalidManifest, maxMetadataWalkNodes)
+		}
+		*budget--
+		if err := validateMetadataValueBounded(value, prefix+"."+key, depth, budget); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateMetadataValue(value any, keyPath string) error {
+func validateMetadataValueBounded(value any, keyPath string, depth int, budget *int) error {
 	switch v := value.(type) {
 	case nil, bool, string,
 		int64, int32, int16, int8, int,
@@ -91,21 +109,17 @@ func validateMetadataValue(value any, keyPath string) error {
 		return nil
 	case []any:
 		for idx, item := range v {
+			if *budget <= 0 {
+				return fmt.Errorf("%w: plugin.metadata exceeds %d nodes", ErrInvalidManifest, maxMetadataWalkNodes)
+			}
+			*budget--
 			if err := validateScalar(item); err != nil {
 				return fmt.Errorf("%s[%d]: %w", keyPath, idx, err)
 			}
 		}
 		return nil
 	case map[string]any:
-		for k, item := range v {
-			if strings.TrimSpace(k) == "" {
-				return fmt.Errorf("%s has nested empty key", keyPath)
-			}
-			if err := validateMetadataValue(item, keyPath+"."+k); err != nil {
-				return err
-			}
-		}
-		return nil
+		return walkMetadata(v, keyPath, depth+1, budget)
 	default:
 		return fmt.Errorf("%s has unsupported type %T", keyPath, value)
 	}

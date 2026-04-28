@@ -148,6 +148,7 @@ var (
 	ErrPluginNotFound         = plugin.ErrPluginNotFound
 	ErrPluginNameConflict     = plugin.ErrPluginNameConflict
 	ErrDuplicatePluginRef     = errors.New("manager: duplicate plugin ref")
+	ErrWorkspaceDirConflict   = errors.New("manager: workspace dir conflict")
 	ErrWorkspaceNotFound      = workspace.ErrWorkspaceNotFound
 	ErrAliasConflict          = workspace.ErrAliasConflict
 	ErrAgentTypeUnknown       = agent.ErrAgentTypeUnknown

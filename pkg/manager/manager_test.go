@@ -196,7 +196,59 @@ func TestManagerCreateWorkspace_SubmitFailureDeletesRowWithoutStatusWrite(t *tes
 	}
 }
 
-func TestManagerDeletePlugin_StorageDeleteFailureDoesNotDeleteRepository(t *testing.T) {
+// errForcedWorkspaceDeleteCompensation is returned by failWorkspaceDeleteRepo.Delete for tests.
+var errForcedWorkspaceDeleteCompensation = errors.New("forced workspace delete failure")
+
+type failWorkspaceDeleteRepo struct {
+	*workspace.MemoryRepository
+}
+
+func (*failWorkspaceDeleteRepo) Delete(context.Context, workspace.WorkspaceID) error {
+	return errForcedWorkspaceDeleteCompensation
+}
+
+func TestManagerCreateWorkspace_SubmitFailure_CompensatingDeleteFails_JoinsErrors(t *testing.T) {
+	t.Parallel()
+
+	managerInstance := newTestManager(t, testManagerOptions{
+		workspaceRepo: &failWorkspaceDeleteRepo{MemoryRepository: workspace.NewMemoryRepository()},
+	})
+	pluginBody := buildPluginZip(t, "demo-plugin", "body")
+	plug, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "demo-plugin",
+		Content: bytes.NewReader(pluginBody),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Alias:        Alias("JoinErr"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": t.TempDir()},
+		Plugins:      []PluginRef{{ID: plug.ID}},
+	})
+	if err == nil {
+		t.Fatal("CreateWorkspace() error = nil, want non-nil")
+	}
+	if !errors.Is(err, workspace.ErrControllerShutdown) {
+		t.Fatalf("CreateWorkspace() error = %v, want ErrControllerShutdown", err)
+	}
+	if !errors.Is(err, errForcedWorkspaceDeleteCompensation) {
+		t.Fatalf("CreateWorkspace() error should wrap compensating delete failure; got %v", err)
+	}
+
+	row, err := managerInstance.GetWorkspace(context.Background(), WorkspaceID("wsp_fixed"))
+	if err != nil {
+		t.Fatalf("GetWorkspace() error = %v, want row retained when compensation delete fails", err)
+	}
+	if row.Alias != Alias("JoinErr") {
+		t.Fatalf("GetWorkspace() Alias = %q, want JoinErr", row.Alias)
+	}
+}
+
+func TestManagerDeletePlugin_StorageDeleteFailureStillDeletesRepository(t *testing.T) {
 	t.Parallel()
 
 	inner := plugin.NewMemoryStorage()
@@ -213,13 +265,46 @@ func TestManagerDeletePlugin_StorageDeleteFailureDoesNotDeleteRepository(t *test
 		t.Fatalf("CreatePlugin() error = %v", err)
 	}
 
+	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err != nil {
+		t.Fatalf("DeletePlugin() error = %v", err)
+	}
+
+	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); !errors.Is(err, ErrPluginNotFound) {
+		t.Fatalf("GetPlugin() after DeletePlugin error = %v, want ErrPluginNotFound", err)
+	}
+}
+
+func TestManagerDeletePlugin_RepositoryDeleteFailureDoesNotDeleteBlobOrMetadata(t *testing.T) {
+	t.Parallel()
+
+	stor := plugin.NewMemoryStorage()
+	repoWrap := &errOnPluginRepoDelete{MemoryRepository: plugin.NewMemoryRepository()}
+	managerInstance := newTestManager(t, testManagerOptions{
+		pluginRepo:    repoWrap,
+		pluginStorage: stor,
+	})
+
+	body := buildPluginZip(t, "repo-fail", "blob")
+	created, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
+		Name:    "repo-fail",
+		Content: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("CreatePlugin() error = %v", err)
+	}
+
 	if err := managerInstance.DeletePlugin(context.Background(), created.ID); err == nil {
 		t.Fatal("DeletePlugin() error = nil, want non-nil")
 	}
 
 	if _, err := managerInstance.GetPlugin(context.Background(), created.ID); err != nil {
-		t.Fatalf("GetPlugin() after failed DeletePlugin error = %v, want nil", err)
+		t.Fatalf("GetPlugin() error = %v, want metadata still present", err)
 	}
+	rc, _, err := stor.Get(context.Background(), plugin.PluginID(created.ID))
+	if err != nil {
+		t.Fatalf("storage Get() error = %v, want blob still present", err)
+	}
+	_ = rc.Close()
 }
 
 func TestManagerDeletePlugin_StorageNotFoundStillDeletesRepository(t *testing.T) {
@@ -376,6 +461,78 @@ func TestManagerCreateWorkspaceRejectsDuplicatePluginRefs(t *testing.T) {
 	}
 }
 
+func TestManagerCreateWorkspaceRejectsDuplicateLocaldirDir(t *testing.T) {
+	t.Parallel()
+
+	builder := NewBuilder()
+	builder.PluginRepository = plugin.NewMemoryRepository()
+	builder.PluginStorage = plugin.NewMemoryStorage()
+	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.IDGenerator = &sequenceIDGenerator{
+		pluginID: PluginID("plg_fixed"),
+		workspaceIDs: []WorkspaceID{
+			WorkspaceID("wsp_first"),
+			WorkspaceID("wsp_second"),
+		},
+	}
+	builder.InstallWorkers = 1
+	builder.ProbeInterval = time.Hour
+	builder.ProbeWorkers = 1
+	builder.ProbeTimeout = time.Second
+	builder.RegisterAgentSpec(&fakeAgentSpec{})
+	builder.RegisterInfraType(InfraType("localdir"), newFakeInfraRegistry().factory())
+
+	managerInstance, err := builder.Build(context.Background())
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if stopErr := managerInstance.Stop(context.Background()); stopErr != nil && !errors.Is(stopErr, ErrShutdown) {
+			t.Fatalf("Stop() error = %v", stopErr)
+		}
+	})
+
+	if err := managerInstance.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "shared")
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Alias:        Alias("Alice"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": dir},
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace(first) error = %v", err)
+	}
+
+	_, err = managerInstance.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Namespace:    Namespace("other"),
+		Alias:        Alias("Bob"),
+		AgentType:    AgentType("claude-code"),
+		InfraType:    InfraType("localdir"),
+		InfraOptions: infraops.Options{"dir": filepath.Join(dir, ".")},
+	})
+	if err == nil {
+		t.Fatal("CreateWorkspace(second) error = nil, want non-nil")
+	}
+	if !errors.Is(err, ErrWorkspaceDirConflict) {
+		t.Fatalf("CreateWorkspace(second) error = %v, want ErrWorkspaceDirConflict", err)
+	}
+
+	rows, next, err := managerInstance.ListWorkspaces(context.Background(), ListWorkspacesOptions{})
+	if err != nil {
+		t.Fatalf("ListWorkspaces() error = %v", err)
+	}
+	if next != "" {
+		t.Fatalf("ListWorkspaces() next cursor = %q, want empty", next)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListWorkspaces() rows = %d, want 1", len(rows))
+	}
+}
+
 func TestNewInfraOps_RejectsEmptyDir(t *testing.T) {
 	t.Parallel()
 
@@ -459,11 +616,21 @@ func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing
 
 	<-pauseRepo.insertDone
 
-	if err := managerInstance.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() error = %v", err)
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- managerInstance.Stop(context.Background())
+	}()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned before in-flight API drained, err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Stop should wait for in-flight CreateWorkspace to complete.
 	}
 
 	close(pauseRepo.allowProceed)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
 	<-createDone
 
 	if createErr == nil {
@@ -585,6 +752,7 @@ type testManagerOptions struct {
 	probeInterval time.Duration
 	pluginRepo    plugin.Repository
 	pluginStorage plugin.Storage
+	workspaceRepo workspace.Repository
 }
 
 // errOnPluginStorageDelete wraps MemoryStorage and forces Delete to fail.
@@ -594,6 +762,15 @@ type errOnPluginStorageDelete struct {
 
 func (errOnPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
 	return errors.New("forced storage delete failure")
+}
+
+// errOnPluginRepoDelete wraps MemoryRepository and forces Delete to fail.
+type errOnPluginRepoDelete struct {
+	*plugin.MemoryRepository
+}
+
+func (r *errOnPluginRepoDelete) Delete(ctx context.Context, id plugin.PluginID) error {
+	return errors.New("forced repository delete failure")
 }
 
 // notFoundPluginStorageDelete wraps MemoryStorage and makes Delete return ErrStorageNotFound.
@@ -626,7 +803,11 @@ func newTestManager(t *testing.T, opts testManagerOptions) Manager {
 	} else {
 		builder.PluginStorage = plugin.NewMemoryStorage()
 	}
-	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	if opts.workspaceRepo != nil {
+		builder.WorkspaceRepository = opts.workspaceRepo
+	} else {
+		builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	}
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_fixed"),
 		nextWorkspaceID: WorkspaceID("wsp_fixed"),
@@ -657,6 +838,33 @@ type fixedIDGenerator struct {
 
 func (g fixedIDGenerator) PluginID() PluginID       { return g.nextPluginID }
 func (g fixedIDGenerator) WorkspaceID() WorkspaceID { return g.nextWorkspaceID }
+
+type sequenceIDGenerator struct {
+	pluginID     PluginID
+	workspaceIDs []WorkspaceID
+	mu           sync.Mutex
+	next         int
+}
+
+func (g *sequenceIDGenerator) PluginID() PluginID {
+	return g.pluginID
+}
+
+func (g *sequenceIDGenerator) WorkspaceID() WorkspaceID {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if len(g.workspaceIDs) == 0 {
+		return WorkspaceID("wsp_sequence")
+	}
+	if g.next >= len(g.workspaceIDs) {
+		return g.workspaceIDs[len(g.workspaceIDs)-1]
+	}
+
+	id := g.workspaceIDs[g.next]
+	g.next++
+	return id
+}
 
 func waitForWorkspaceStatus(t *testing.T, managerInstance Manager, id WorkspaceID, want WorkspaceStatus, timeout time.Duration) Workspace {
 	t.Helper()

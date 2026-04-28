@@ -100,6 +100,14 @@ device/inode as the opened root (so a replaced path is not followed).
    errors (program not found, IO failure) bubble up.
 6. Record `Duration`.
 
+**Cwd / `WorkDir`:** After `*os.Root` validates the relative work
+directory, Linux sets `Cmd.Dir` to `/proc/self/fd/<fd>` for an opened
+directory handle so the child process is not launched with a stale
+joined string path. Non-Linux builds return `infraops.ErrPathOutsideDir`
+instead of falling back to `filepath.Join(Dir(), workDir)`. The
+implementation also rejects when the configured `dir` path is a symlink
+or no longer the same inode as the opened root (path replacement).
+
 ### `PutFile(ctx, path, content, mode)`
 
 1. Resolve `path` through the `*os.Root`; reject escapes.
@@ -147,9 +155,10 @@ avoid socket churn.
   cleared flag, the HTTP client) with a mutex; the underlying file
   system handles per-call atomicity.
 - Two `localdir` instances pointing at the same `dir` would race;
-  the manager refuses to register two workspaces with the same
-  `localdir.dir`. (This check happens at workspace-creation time,
-  not in this package.)
+  the manager canonicalizes `localdir.dir` with `filepath.Clean` and
+  refuses to register two workspaces with the same canonical path
+  (across namespaces and status values). This check happens at
+  workspace-creation time, not in this package.
 
 ## Safety
 

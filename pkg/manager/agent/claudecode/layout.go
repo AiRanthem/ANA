@@ -2,6 +2,8 @@ package claudecode
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -130,7 +132,7 @@ func addManifestSectionPaths(add func(string), pluginBase string, entries map[st
 	for _, key := range keys {
 		entry := entries[key]
 		cleanPath := path.Clean(strings.TrimSpace(entry.Path))
-		if cleanPath == "." || cleanPath == "/" || strings.HasPrefix(cleanPath, "../") || path.IsAbs(cleanPath) {
+		if layoutPathUnsafe(cleanPath) {
 			continue
 		}
 		add(path.Join(pluginBase, cleanPath))
@@ -186,8 +188,27 @@ func buildWritePlan(pluginRoot fs.FS, pluginBase string) ([]writePlan, error) {
 	return planned, nil
 }
 
+func layoutPathUnsafe(cleanPath string) bool {
+	if cleanPath == "." || cleanPath == "/" || path.IsAbs(cleanPath) {
+		return true
+	}
+	if strings.HasPrefix(cleanPath, "../") {
+		return true
+	}
+	for _, seg := range strings.Split(cleanPath, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func mapPath(pluginBase, srcPath string) (string, error) {
 	clean := path.Clean(srcPath)
+	if layoutPathUnsafe(clean) {
+		return "", fmt.Errorf("%w: unsafe path %q", ErrInvalidPluginLayout, srcPath)
+	}
+
 	switch clean {
 	case manifestFile, "AGENTS.md", "README.md":
 		return path.Join(pluginBase, clean), nil
@@ -290,7 +311,14 @@ func sanitizePluginName(name string) string {
 
 	clean := strings.Trim(b.String(), "-")
 	if len(clean) > 64 {
-		clean = strings.Trim(clean[:64], "-")
+		sum := sha256.Sum256([]byte(clean))
+		suffix := hex.EncodeToString(sum[:4])
+		const maxPrefix = 64 - 1 - 8 // "-" + 8 hex chars
+		prefix := strings.Trim(clean[:maxPrefix], "-")
+		if prefix == "" {
+			prefix = "plugin"
+		}
+		clean = prefix + "-" + suffix
 	}
 	return clean
 }

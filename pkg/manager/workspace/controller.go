@@ -229,6 +229,19 @@ func (c *Controller) Submit(ctx context.Context, w Workspace, params agent.Insta
 // Delete tears a workspace down synchronously and always attempts repository deletion.
 // It drops any queued install jobs for the workspace, cancels an in-flight install for
 // that id, then waits until no worker is still running that install before opening infra.
+func (c *Controller) logDeleteCleanupFailure(ctx context.Context, row Workspace, phase string, err error) {
+	logs.FromContext(ctx).Warn("workspace delete cleanup prerequisite failed",
+		"component", "workspace_controller",
+		"workspace_id", row.ID,
+		"workspace_alias", row.Alias,
+		"namespace", row.Namespace,
+		"agent_type", row.AgentType,
+		"infra_type", row.InfraType,
+		"phase", phase,
+		"err", err,
+	)
+}
+
 func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 	if c.stopped.Load() {
 		return ErrControllerShutdown
@@ -249,16 +262,18 @@ func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 
 	factory, ok := c.factories.Get(infraops.InfraType(row.InfraType))
 	if !ok {
-		return fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, row.InfraType)
+		c.logDeleteCleanupFailure(ctx, row, "factory_lookup", fmt.Errorf("%w: %q", infraops.ErrInfraTypeUnknown, row.InfraType))
+		return c.repo.Delete(ctx, id)
 	}
 	ops, err := factory(ctx, row.InfraOptions)
 	if err != nil {
-		return fmt.Errorf("workspace delete build infra %q: %w", row.ID, err)
+		c.logDeleteCleanupFailure(ctx, row, "factory_build", fmt.Errorf("workspace delete build infra %q: %w", row.ID, err))
+		return c.repo.Delete(ctx, id)
 	}
 
 	spec, ok := c.agentSpecs.Get(agent.AgentType(row.AgentType))
 	if !ok {
-		return fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, row.AgentType)
+		c.logDeleteCleanupFailure(ctx, row, "agent_spec_lookup", fmt.Errorf("%w: %q", agent.ErrAgentTypeUnknown, row.AgentType))
 	}
 
 	if err := ops.Open(ctx); err != nil {
@@ -272,17 +287,19 @@ func (c *Controller) Delete(ctx context.Context, id WorkspaceID) error {
 			"phase", "open",
 			"err", err,
 		)
-	} else if err := spec.Uninstall(ctx, ops); err != nil {
-		logs.FromContext(ctx).Warn("workspace uninstall failed",
-			"component", "workspace_controller",
-			"workspace_id", row.ID,
-			"workspace_alias", row.Alias,
-			"namespace", row.Namespace,
-			"agent_type", row.AgentType,
-			"infra_type", row.InfraType,
-			"phase", "uninstall",
-			"err", err,
-		)
+	} else if ok {
+		if err := spec.Uninstall(ctx, ops); err != nil {
+			logs.FromContext(ctx).Warn("workspace uninstall failed",
+				"component", "workspace_controller",
+				"workspace_id", row.ID,
+				"workspace_alias", row.Alias,
+				"namespace", row.Namespace,
+				"agent_type", row.AgentType,
+				"infra_type", row.InfraType,
+				"phase", "uninstall",
+				"err", err,
+			)
+		}
 	}
 	if err := ops.Clear(ctx); err != nil {
 		logs.FromContext(ctx).Warn("workspace clear failed",
@@ -412,7 +429,8 @@ func (c *Controller) dequeue() (installJob, context.Context, context.CancelFunc,
 }
 
 func (c *Controller) runInstall(job installJob, parent context.Context) {
-	persistCtx := context.Background()
+	persistCtx, persistCancel := newRepoWriteContext(parent)
+	defer persistCancel()
 
 	if err := parent.Err(); err != nil {
 		c.transitionToFailed(persistCtx, parent, job.workspace.ID, failureForShutdown(c.clock()), time.Time{})
@@ -480,7 +498,14 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		return
 	}
 	if latest.Status != StatusInit {
-		// Snapshot expired (for example install watchdog moved init -> failed); do not promote status.
+		// Snapshot expired (for example install watchdog moved init -> failed).
+		// If the failure was an install timeout, preserve the directory for diagnosis.
+		if latest.Status == StatusFailed && latest.StatusError != nil && latest.StatusError.Code == "install.timeout" {
+			return
+		}
+		// Otherwise the install side effects already ran, so best-effort cleanup
+		// avoids leaving runtime state inconsistent with persisted status.
+		c.cleanupStaleInstallEffects(installCtx, latest, ops)
 		return
 	}
 
@@ -500,14 +525,23 @@ func (c *Controller) runInstall(job installJob, parent context.Context) {
 		}
 		return err
 	}); err != nil {
-		logs.FromContext(installCtx).Error("workspace healthy transition failed",
+		c.transitionToFailed(persistCtx, installCtx, job.workspace.ID,
+			failureFromError(c.clock(), "status", fmt.Errorf("mark healthy after install: %w", err)),
+			time.Time{},
+		)
+	}
+}
+
+func (c *Controller) cleanupStaleInstallEffects(ctx context.Context, row Workspace, ops infraops.InfraOps) {
+	if err := ops.Clear(ctx); err != nil {
+		logs.FromContext(ctx).Warn("workspace stale install cleanup failed",
 			"component", "workspace_controller",
-			"workspace_id", latest.ID,
-			"workspace_alias", latest.Alias,
-			"namespace", latest.Namespace,
-			"agent_type", latest.AgentType,
-			"infra_type", latest.InfraType,
-			"phase", "status",
+			"workspace_id", row.ID,
+			"workspace_alias", row.Alias,
+			"namespace", row.Namespace,
+			"agent_type", row.AgentType,
+			"infra_type", row.InfraType,
+			"phase", "clear_after_stale_install",
 			"err", err,
 		)
 	}

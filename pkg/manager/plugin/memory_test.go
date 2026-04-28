@@ -82,6 +82,77 @@ func TestMemoryRepository_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestMemoryRepository_List_MaxIntLimitWithNonZeroCursorDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("List() panicked: %v", r)
+		}
+	}()
+
+	repo := NewMemoryRepository()
+	now := time.Now().UTC()
+	for i, name := range []string{"alpha", "beta"} {
+		p := Plugin{
+			ID:        PluginID("plg_" + name),
+			Namespace: "default",
+			Name:      name,
+			Manifest: Manifest{
+				SchemaVersion: 1,
+				Plugin:        ManifestPlugin{Name: name},
+			},
+			CreatedAt: now.Add(time.Duration(i) * time.Second),
+			UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}
+		if err := repo.Insert(context.Background(), p); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	maxInt := int(^uint(0) >> 1)
+	rows, next, err := repo.List(context.Background(), ListOptions{Limit: maxInt, Cursor: "1"})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(rows))
+	}
+	if next != "" {
+		t.Fatalf("List() next = %q, want empty", next)
+	}
+}
+
+func TestMemoryRepository_InsertDuplicateIDReturnsIDConflict(t *testing.T) {
+	t.Parallel()
+
+	repo := NewMemoryRepository()
+	now := time.Now().UTC()
+	base := Plugin{
+		ID:        "plg_dup_id",
+		Namespace: "default",
+		Name:      "alpha",
+		Manifest: Manifest{
+			SchemaVersion: 1,
+			Plugin:        ManifestPlugin{Name: "alpha"},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := repo.Insert(context.Background(), base); err != nil {
+		t.Fatalf("Insert(base) error = %v", err)
+	}
+
+	conflict := base
+	conflict.Name = "beta"
+	conflict.Manifest.Plugin.Name = "beta"
+	err := repo.Insert(context.Background(), conflict)
+	if !errors.Is(err, ErrPluginIDConflict) {
+		t.Fatalf("Insert(duplicate id) error = %v, want ErrPluginIDConflict", err)
+	}
+	if errors.Is(err, ErrPluginNameConflict) {
+		t.Fatalf("Insert(duplicate id) error = %v, want no ErrPluginNameConflict", err)
+	}
+}
+
 func TestMemoryStorage_PutGetDelete(t *testing.T) {
 	t.Parallel()
 

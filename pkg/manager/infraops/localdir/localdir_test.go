@@ -874,6 +874,54 @@ func TestMixedWorkloadConcurrency(t *testing.T) {
 	}
 }
 
+func TestNilContextDoesNotPanicOnPublicMethods(t *testing.T) {
+	t.Parallel()
+	requireProgram(t, "true")
+
+	ops := mustNewOps(t, infraops.Options{"dir": filepath.Join(t.TempDir(), "workspace")})
+
+	mustNotPanic(t, func() {
+		if err := ops.Init(nil); err != nil {
+			t.Fatalf("Init(nil) error = %v", err)
+		}
+	})
+	mustNotPanic(t, func() {
+		if err := ops.Open(nil); err != nil {
+			t.Fatalf("Open(nil) error = %v", err)
+		}
+	})
+	mustNotPanic(t, func() {
+		if err := ops.PutFile(nil, "x.txt", strings.NewReader("x"), 0o644); err != nil {
+			t.Fatalf("PutFile(nil) error = %v", err)
+		}
+	})
+	mustNotPanic(t, func() {
+		rc, err := ops.GetFile(nil, "x.txt")
+		if err != nil {
+			t.Fatalf("GetFile(nil) error = %v", err)
+		}
+		_ = rc.Close()
+	})
+	mustNotPanic(t, func() {
+		_, err := ops.Exec(nil, infraops.ExecCommand{Program: "true"})
+		if err != nil {
+			t.Fatalf("Exec(nil) error = %v", err)
+		}
+	})
+	mustNotPanic(t, func() {
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/ping", nil)
+		if err != nil {
+			t.Fatalf("NewRequest error = %v", err)
+		}
+		_, _ = ops.Request(nil, 9, req)
+	})
+	mustNotPanic(t, func() {
+		if err := ops.Clear(nil); err != nil {
+			t.Fatalf("Clear(nil) error = %v", err)
+		}
+	})
+}
+
 func mustNewOps(t *testing.T, opts infraops.Options) infraops.InfraOps {
 	t.Helper()
 
@@ -909,6 +957,16 @@ func requireProgram(t *testing.T, program string) {
 
 func strconvItoa(v int) string {
 	return strconv.Itoa(v)
+}
+
+func mustNotPanic(t *testing.T, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic: %v", r)
+		}
+	}()
+	fn()
 }
 
 type slowReader struct {

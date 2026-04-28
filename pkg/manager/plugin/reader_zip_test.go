@@ -293,4 +293,31 @@ func TestOpenZipReader_PreservesExecutableBit(t *testing.T) {
 	}
 }
 
+func TestOpenZipReader_AcceptsExplicitDirectoryEntries(t *testing.T) {
+	t.Parallel()
+
+	zipBytes := buildZipWithMode(t, []zipEntry{
+		{name: "manifest.toml", body: []byte(validManifest("demo", "skills/s1")), mode: 0o644},
+		{name: "skills/", body: nil, mode: fs.ModeDir | 0o755},
+		{name: "skills/s1/", body: nil, mode: fs.ModeDir | 0o755},
+		{name: "skills/s1/SKILL.md", body: []byte("# skill\n"), mode: 0o644},
+	})
+	r, err := OpenZipReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		t.Fatalf("OpenZipReader() error = %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	content, err := fs.ReadFile(r.FS(), "skills/s1/SKILL.md")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "# skill\n" {
+		t.Fatalf("content = %q", string(content))
+	}
+	if r.Manifest().Plugin.Name != "demo" {
+		t.Fatalf("manifest name = %q, want demo", r.Manifest().Plugin.Name)
+	}
+}
+
 var _ fs.FS = fstest.MapFS{}
