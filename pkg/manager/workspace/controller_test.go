@@ -702,7 +702,7 @@ type controllerHarness struct {
 	controller *Controller
 	repo       Repository
 	flaky      *flakyRepo
-	storage    *plugin.MemoryStorage
+	storage    *fakePluginStorage
 	spec       *fakeAgentSpec
 	registry   *fakeInfraRegistry
 	pluginObj  plugin.StoredObject
@@ -751,7 +751,7 @@ func newControllerHarness(t *testing.T, opts controllerHarnessOptions) *controll
 		t.Fatalf("Register(factory) error = %v", err)
 	}
 
-	storage := plugin.NewMemoryStorage()
+	storage := newFakePluginStorage()
 	obj := seedPluginZip(t, storage, plugin.PluginID("plg_1"), "demo-plugin")
 
 	if opts.repo != nil && opts.flakyRepo {
@@ -1063,7 +1063,7 @@ func (i *fakeInfra) Clear(context.Context) error {
 func TestAttachPlugins_RejectsBatchLayoutDirectoryCollision(t *testing.T) {
 	t.Parallel()
 
-	storage := plugin.NewMemoryStorage()
+	storage := newFakePluginStorage()
 	objA := seedPluginZip(t, storage, plugin.PluginID("plg_a"), "my--plugin")
 	objB := seedPluginZip(t, storage, plugin.PluginID("plg_b"), "my-plugin")
 
@@ -1333,7 +1333,7 @@ func TestController_TransitionToFailed_UsesCASFromInitOnly(t *testing.T) {
 	}
 }
 
-func seedPluginZip(t *testing.T, storage *plugin.MemoryStorage, id plugin.PluginID, name string) plugin.StoredObject {
+func seedPluginZip(t *testing.T, storage *fakePluginStorage, id plugin.PluginID, name string) plugin.StoredObject {
 	t.Helper()
 
 	body := buildPluginZip(t, name)
@@ -1382,3 +1382,25 @@ func addZipFile(t *testing.T, zw *zip.Writer, name string, body []byte) {
 		t.Fatalf("zip.Write(%q) error = %v", name, err)
 	}
 }
+
+
+type fakePluginStorage struct {
+	blobs map[plugin.PluginID][]byte
+}
+func newFakePluginStorage() *fakePluginStorage { return &fakePluginStorage{blobs: make(map[plugin.PluginID][]byte)} }
+func (s *fakePluginStorage) Put(_ context.Context, id plugin.PluginID, body io.Reader) (plugin.StoredObject, error) {
+	b, _ := io.ReadAll(body)
+	s.blobs[id] = b
+	hash, size, _ := plugin.Hash(bytes.NewReader(b))
+	return plugin.StoredObject{ContentHash: hash, Size: size}, nil
+}
+func (s *fakePluginStorage) Get(_ context.Context, id plugin.PluginID) (io.ReadCloser, plugin.StoredObject, error) {
+	b, ok := s.blobs[id]
+	if !ok { return nil, plugin.StoredObject{}, plugin.ErrStorageNotFound }
+	hash, size, _ := plugin.Hash(bytes.NewReader(b))
+	return io.NopCloser(bytes.NewReader(b)), plugin.StoredObject{ContentHash: hash, Size: size}, nil
+}
+func (s *fakePluginStorage) Delete(context.Context, plugin.PluginID) error { return nil }
+func (s *fakePluginStorage) PresignURL(context.Context, plugin.PluginID, plugin.PresignOptions) (string, error) { return "", nil }
+func (s *fakePluginStorage) List(context.Context) ([]plugin.PluginID, error) { return nil, nil }
+func (s *fakePluginStorage) Close(context.Context) error { return nil }
