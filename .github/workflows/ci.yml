@@ -51,5 +51,8 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Run workspace stability tests
+        run: go test -race -shuffle=on -count=10 ./pkg/manager/workspace
+
       - name: Run build
         run: go build ./...
