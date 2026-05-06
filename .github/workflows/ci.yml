@@ -36,16 +36,11 @@ jobs:
             exit 1
           fi
 
-      - name: Scan TODO.md and MEMO.md
+      - name: Forbid TODO.md and MEMO.md
         run: |
           for file in TODO.md MEMO.md; do
-            if [ ! -f "$file" ]; then
-              continue
-            fi
-            unresolved="$(rg -n '^\\s*- \\[ \\]' "$file" || true)"
-            if [ -n "$unresolved" ]; then
-              echo "The following files contain unresolved checklist items:"
-              echo "$unresolved" | sed -e "s/^/$file: /"
+            if [ -f "$file" ]; then
+              echo "::error file=$file::prohibited planning file is present"
               exit 1
             fi
           done
