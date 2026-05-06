@@ -560,8 +560,8 @@ func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing
 	innerWS := memory.NewWorkspaceRepository()
 	pauseRepo := &pauseInsertWorkspaceRepo{
 		WorkspaceRepository: innerWS,
-		insertDone:       make(chan struct{}),
-		allowProceed:     make(chan struct{}),
+		insertDone:          make(chan struct{}),
+		allowProceed:        make(chan struct{}),
 	}
 
 	spec := &fakeAgentSpec{}

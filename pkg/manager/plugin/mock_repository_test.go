@@ -200,4 +200,3 @@ func parseCursor(cursor string) (int, error) {
 	}
 	return offset, nil
 }
-

@@ -1383,11 +1383,13 @@ func addZipFile(t *testing.T, zw *zip.Writer, name string, body []byte) {
 	}
 }
 
-
 type fakePluginStorage struct {
 	blobs map[plugin.PluginID][]byte
 }
-func newFakePluginStorage() *fakePluginStorage { return &fakePluginStorage{blobs: make(map[plugin.PluginID][]byte)} }
+
+func newFakePluginStorage() *fakePluginStorage {
+	return &fakePluginStorage{blobs: make(map[plugin.PluginID][]byte)}
+}
 func (s *fakePluginStorage) Put(_ context.Context, id plugin.PluginID, body io.Reader) (plugin.StoredObject, error) {
 	b, _ := io.ReadAll(body)
 	s.blobs[id] = b
@@ -1396,11 +1398,15 @@ func (s *fakePluginStorage) Put(_ context.Context, id plugin.PluginID, body io.R
 }
 func (s *fakePluginStorage) Get(_ context.Context, id plugin.PluginID) (io.ReadCloser, plugin.StoredObject, error) {
 	b, ok := s.blobs[id]
-	if !ok { return nil, plugin.StoredObject{}, plugin.ErrStorageNotFound }
+	if !ok {
+		return nil, plugin.StoredObject{}, plugin.ErrStorageNotFound
+	}
 	hash, size, _ := plugin.Hash(bytes.NewReader(b))
 	return io.NopCloser(bytes.NewReader(b)), plugin.StoredObject{ContentHash: hash, Size: size}, nil
 }
 func (s *fakePluginStorage) Delete(context.Context, plugin.PluginID) error { return nil }
-func (s *fakePluginStorage) PresignURL(context.Context, plugin.PluginID, plugin.PresignOptions) (string, error) { return "", nil }
+func (s *fakePluginStorage) PresignURL(context.Context, plugin.PluginID, plugin.PresignOptions) (string, error) {
+	return "", nil
+}
 func (s *fakePluginStorage) List(context.Context) ([]plugin.PluginID, error) { return nil, nil }
-func (s *fakePluginStorage) Close(context.Context) error { return nil }
+func (s *fakePluginStorage) Close(context.Context) error                     { return nil }

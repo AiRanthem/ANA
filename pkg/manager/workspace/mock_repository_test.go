@@ -373,4 +373,3 @@ func validateImmutableFields(existing Workspace, updated Workspace) error {
 	}
 	return nil
 }
-
