@@ -44,8 +44,9 @@ jobs:
             fi
             unresolved="$(rg -n '^\\s*- \\[ \\]' "$file" || true)"
             if [ -n "$unresolved" ]; then
-              echo "::warning file=$file::unresolved checklist items found"
-              echo "$unresolved" | sed -e "s/^/$file:/"
+              echo "The following files contain unresolved checklist items:"
+              echo "$unresolved" | sed -e "s/^/$file: /"
+              exit 1
             fi
           done
 
