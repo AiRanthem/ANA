@@ -1259,7 +1259,7 @@ func TestController_PreservesInfraWhenInstallTimesOutAfterStatusRace(t *testing.
 func TestController_PersistAttachedPluginsPreservesConcurrentMetadataUpdate(t *testing.T) {
 	t.Parallel()
 
-	installStarted := make(chan struct{})
+	installStarted := make(chan struct{}, 1)
 	metaWritten := make(chan struct{})
 	h := newControllerHarness(t, controllerHarnessOptions{
 		installFn: func(ctx context.Context, _ infraops.InfraOps, _ agent.InstallParams) error {
