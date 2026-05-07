@@ -385,10 +385,10 @@ func TestProbeScheduler_WatchdogUsesInitExpectation(t *testing.T) {
 
 	repo := NewMemoryRepository()
 	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
-	row := testWorkspace("wsp_watchdog_expect", "default", "wdog", StatusHealthy, now)
-	if err := repo.Insert(context.Background(), row); err != nil {
-		t.Fatalf("Insert() error = %v", err)
-	}
+	h := newSchedulerHarness(t, schedulerHarnessOptions{
+		repo: repo,
+	})
+	row := h.insertWorkspaceAt(t, "wsp_watchdog_expect", "wdog", StatusHealthy, now)
 
 	err := repo.UpdateStatusCAS(
 		context.Background(),

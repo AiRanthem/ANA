@@ -36,11 +36,23 @@ jobs:
             exit 1
           fi
 
+      - name: Forbid TODO.md and MEMO.md
+        run: |
+          for file in TODO.md MEMO.md; do
+            if [ -f "$file" ]; then
+              echo "::error file=$file::prohibited planning file is present"
+              exit 1
+            fi
+          done
+
       - name: Run go vet
         run: go vet ./...
 
       - name: Run tests
         run: go test ./...
+
+      - name: Run workspace stability tests
+        run: go test -race -shuffle=on -count=10 ./pkg/manager/workspace
 
       - name: Run build
         run: go build ./...

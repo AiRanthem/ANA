@@ -1,9 +1,10 @@
-package workspace
+package memory
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/AiRanthem/ANA/pkg/manager/workspace"
 	"slices"
 	"strings"
 	"sync"
@@ -13,22 +14,27 @@ import (
 var errRepositoryClosed = fmt.Errorf("workspace: repository closed")
 
 // MemoryRepository is a concurrent-safe in-memory Repository implementation.
-type MemoryRepository struct {
+type WorkspaceRepository struct {
 	mu           sync.RWMutex
-	byID         map[WorkspaceID]Workspace
-	idByAliasKey map[string]WorkspaceID
+	byID         map[workspace.WorkspaceID]workspace.Workspace
+	idByAliasKey map[workspaceAliasIndexKey]workspace.WorkspaceID
 	closed       bool
 }
 
-// NewMemoryRepository constructs an empty in-memory workspace repository.
-func NewMemoryRepository() *MemoryRepository {
-	return &MemoryRepository{
-		byID:         make(map[WorkspaceID]Workspace),
-		idByAliasKey: make(map[string]WorkspaceID),
+type workspaceAliasIndexKey struct {
+	namespace workspace.Namespace
+	alias     workspace.Alias
+}
+
+// NewWorkspaceRepository constructs an empty in-memory workspace repository.
+func NewWorkspaceRepository() *WorkspaceRepository {
+	return &WorkspaceRepository{
+		byID:         make(map[workspace.WorkspaceID]workspace.Workspace),
+		idByAliasKey: make(map[workspaceAliasIndexKey]workspace.WorkspaceID),
 	}
 }
 
-func (r *MemoryRepository) Insert(_ context.Context, w Workspace) error {
+func (r *WorkspaceRepository) Insert(_ context.Context, w workspace.Workspace) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -44,7 +50,7 @@ func (r *MemoryRepository) Insert(_ context.Context, w Workspace) error {
 
 	aliasKey := workspaceAliasKey(w.Namespace, w.Alias)
 	if _, ok := r.idByAliasKey[aliasKey]; ok {
-		return ErrAliasConflict
+		return workspace.ErrAliasConflict
 	}
 
 	r.byID[w.ID] = cloneWorkspace(w)
@@ -52,36 +58,36 @@ func (r *MemoryRepository) Insert(_ context.Context, w Workspace) error {
 	return nil
 }
 
-func (r *MemoryRepository) Get(_ context.Context, id WorkspaceID) (Workspace, error) {
+func (r *WorkspaceRepository) Get(_ context.Context, id workspace.WorkspaceID) (workspace.Workspace, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	if r.closed {
-		return Workspace{}, errRepositoryClosed
+		return workspace.Workspace{}, errRepositoryClosed
 	}
 	row, ok := r.byID[id]
 	if !ok {
-		return Workspace{}, ErrWorkspaceNotFound
+		return workspace.Workspace{}, workspace.ErrWorkspaceNotFound
 	}
 	return cloneWorkspace(row), nil
 }
 
-func (r *MemoryRepository) GetByAlias(_ context.Context, namespace Namespace, alias Alias) (Workspace, error) {
+func (r *WorkspaceRepository) GetByAlias(_ context.Context, namespace workspace.Namespace, alias workspace.Alias) (workspace.Workspace, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	if r.closed {
-		return Workspace{}, errRepositoryClosed
+		return workspace.Workspace{}, errRepositoryClosed
 	}
 
 	id, ok := r.idByAliasKey[workspaceAliasKey(namespace, alias)]
 	if !ok {
-		return Workspace{}, ErrWorkspaceNotFound
+		return workspace.Workspace{}, workspace.ErrWorkspaceNotFound
 	}
 	return cloneWorkspace(r.byID[id]), nil
 }
 
-func (r *MemoryRepository) List(_ context.Context, opts ListOptions) ([]Workspace, string, error) {
+func (r *WorkspaceRepository) List(_ context.Context, opts workspace.ListOptions) ([]workspace.Workspace, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -94,12 +100,12 @@ func (r *MemoryRepository) List(_ context.Context, opts ListOptions) ([]Workspac
 		limit = 50
 	}
 
-	cursorNamespace, cursorAlias, err := parseCursor(opts.Cursor)
+	cursorNamespace, cursorAlias, err := parseWorkspaceCursor(opts.Cursor)
 	if err != nil {
 		return nil, "", err
 	}
 
-	filtered := make([]Workspace, 0, len(r.byID))
+	filtered := make([]workspace.Workspace, 0, len(r.byID))
 	for _, row := range r.byID {
 		if opts.Namespace != "" && row.Namespace != opts.Namespace {
 			continue
@@ -122,12 +128,12 @@ func (r *MemoryRepository) List(_ context.Context, opts ListOptions) ([]Workspac
 		filtered = append(filtered, cloneWorkspace(row))
 	}
 
-	slices.SortFunc(filtered, func(a, b Workspace) int {
+	slices.SortFunc(filtered, func(a, b workspace.Workspace) int {
 		return compareNamespaceAlias(a.Namespace, a.Alias, b.Namespace, b.Alias)
 	})
 
 	if len(filtered) == 0 {
-		return []Workspace{}, "", nil
+		return []workspace.Workspace{}, "", nil
 	}
 
 	end := min(limit, len(filtered))
@@ -140,7 +146,7 @@ func (r *MemoryRepository) List(_ context.Context, opts ListOptions) ([]Workspac
 	return rows, next, nil
 }
 
-func (r *MemoryRepository) Update(_ context.Context, w Workspace) error {
+func (r *WorkspaceRepository) Update(_ context.Context, w workspace.Workspace) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -150,10 +156,10 @@ func (r *MemoryRepository) Update(_ context.Context, w Workspace) error {
 
 	existing, ok := r.byID[w.ID]
 	if !ok {
-		return ErrWorkspaceNotFound
+		return workspace.ErrWorkspaceNotFound
 	}
 	if w.Status != existing.Status {
-		return fmt.Errorf("%w: use UpdateStatus for %q -> %q", ErrInvalidStatusTransition, existing.Status, w.Status)
+		return fmt.Errorf("%w: use UpdateStatus for %q -> %q", workspace.ErrInvalidStatusTransition, existing.Status, w.Status)
 	}
 	if err := validateKnownStatus(w.Status); err != nil {
 		return err
@@ -173,7 +179,7 @@ func (r *MemoryRepository) Update(_ context.Context, w Workspace) error {
 	return nil
 }
 
-func (r *MemoryRepository) UpdateStatus(_ context.Context, id WorkspaceID, status Status, statusError *Error, lastProbeAt time.Time) error {
+func (r *WorkspaceRepository) UpdateStatus(_ context.Context, id workspace.WorkspaceID, status workspace.Status, statusError *workspace.Error, lastProbeAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -183,7 +189,7 @@ func (r *MemoryRepository) UpdateStatus(_ context.Context, id WorkspaceID, statu
 
 	row, ok := r.byID[id]
 	if !ok {
-		return ErrWorkspaceNotFound
+		return workspace.ErrWorkspaceNotFound
 	}
 	if err := validateKnownStatus(status); err != nil {
 		return err
@@ -195,7 +201,7 @@ func (r *MemoryRepository) UpdateStatus(_ context.Context, id WorkspaceID, statu
 	row.Status = status
 	row.LastProbeAt = lastProbeAt
 	row.UpdatedAt = time.Now().UTC()
-	if status == StatusHealthy {
+	if status == workspace.StatusHealthy {
 		row.StatusError = nil
 	} else {
 		row.StatusError = cloneError(statusError)
@@ -204,13 +210,13 @@ func (r *MemoryRepository) UpdateStatus(_ context.Context, id WorkspaceID, statu
 	return nil
 }
 
-func (r *MemoryRepository) UpdateStatusCAS(
+func (r *WorkspaceRepository) UpdateStatusCAS(
 	_ context.Context,
-	id WorkspaceID,
-	writer StatusWriter,
-	expect Status,
-	next Status,
-	statusError *Error,
+	id workspace.WorkspaceID,
+	writer workspace.StatusWriter,
+	expect workspace.Status,
+	next workspace.Status,
+	statusError *workspace.Error,
 	lastProbeAt time.Time,
 ) error {
 	r.mu.Lock()
@@ -221,11 +227,11 @@ func (r *MemoryRepository) UpdateStatusCAS(
 	}
 	row, ok := r.byID[id]
 	if !ok {
-		return ErrWorkspaceNotFound
+		return workspace.ErrWorkspaceNotFound
 	}
 	if row.Status != expect {
 		return fmt.Errorf("%w: workspace %q current=%q expect=%q",
-			ErrStatusPreconditionFailed, id, row.Status, expect)
+			workspace.ErrStatusPreconditionFailed, id, row.Status, expect)
 	}
 	if err := validateKnownStatus(next); err != nil {
 		return err
@@ -237,7 +243,7 @@ func (r *MemoryRepository) UpdateStatusCAS(
 	row.Status = next
 	row.LastProbeAt = lastProbeAt
 	row.UpdatedAt = time.Now().UTC()
-	if next == StatusHealthy {
+	if next == workspace.StatusHealthy {
 		row.StatusError = nil
 	} else {
 		row.StatusError = cloneError(statusError)
@@ -246,27 +252,27 @@ func (r *MemoryRepository) UpdateStatusCAS(
 	return nil
 }
 
-func validateTransitionByWriter(writer StatusWriter, from, to Status) error {
+func validateTransitionByWriter(writer workspace.StatusWriter, from, to workspace.Status) error {
 	switch writer {
-	case StatusWriterController:
-		if from == StatusInit && (to == StatusHealthy || to == StatusFailed) {
+	case workspace.StatusWriterController:
+		if from == workspace.StatusInit && (to == workspace.StatusHealthy || to == workspace.StatusFailed) {
 			return nil
 		}
-	case StatusWriterScheduler:
-		if from == StatusInit && to == StatusFailed {
+	case workspace.StatusWriterScheduler:
+		if from == workspace.StatusInit && to == workspace.StatusFailed {
 			return nil
 		}
-		if from == StatusHealthy && to == StatusFailed {
+		if from == workspace.StatusHealthy && to == workspace.StatusFailed {
 			return nil
 		}
-		if from == StatusFailed && to == StatusHealthy {
+		if from == workspace.StatusFailed && to == workspace.StatusHealthy {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: writer=%q %q->%q", ErrInvalidStatusTransition, writer, from, to)
+	return fmt.Errorf("%w: writer=%q %q->%q", workspace.ErrInvalidStatusTransition, writer, from, to)
 }
 
-func (r *MemoryRepository) Delete(_ context.Context, id WorkspaceID) error {
+func (r *WorkspaceRepository) Delete(_ context.Context, id workspace.WorkspaceID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -276,7 +282,7 @@ func (r *MemoryRepository) Delete(_ context.Context, id WorkspaceID) error {
 
 	row, ok := r.byID[id]
 	if !ok {
-		return ErrWorkspaceNotFound
+		return workspace.ErrWorkspaceNotFound
 	}
 
 	delete(r.byID, id)
@@ -284,23 +290,26 @@ func (r *MemoryRepository) Delete(_ context.Context, id WorkspaceID) error {
 	return nil
 }
 
-func (r *MemoryRepository) Close(_ context.Context) error {
+func (r *WorkspaceRepository) Close(_ context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
 	return nil
 }
 
-func workspaceAliasKey(namespace Namespace, alias Alias) string {
-	return string(namespace) + "\x00" + string(alias)
+func workspaceAliasKey(namespace workspace.Namespace, alias workspace.Alias) workspaceAliasIndexKey {
+	return workspaceAliasIndexKey{
+		namespace: namespace,
+		alias:     alias,
+	}
 }
 
-func encodeCursor(namespace Namespace, alias Alias) string {
+func encodeCursor(namespace workspace.Namespace, alias workspace.Alias) string {
 	raw := string(namespace) + "\x00" + string(alias)
 	return base64.RawStdEncoding.EncodeToString([]byte(raw))
 }
 
-func parseCursor(cursor string) (Namespace, Alias, error) {
+func parseWorkspaceCursor(cursor string) (workspace.Namespace, workspace.Alias, error) {
 	if cursor == "" {
 		return "", "", nil
 	}
@@ -312,7 +321,7 @@ func parseCursor(cursor string) (Namespace, Alias, error) {
 	if len(parts) != 2 {
 		return "", "", fmt.Errorf("workspace: invalid cursor %q", cursor)
 	}
-	return Namespace(parts[0]), Alias(parts[1]), nil
+	return workspace.Namespace(parts[0]), workspace.Alias(parts[1]), nil
 }
 
 func labelsMatch(rowLabels, want map[string]string) bool {
@@ -327,38 +336,38 @@ func labelsMatch(rowLabels, want map[string]string) bool {
 	return true
 }
 
-func compareNamespaceAlias(leftNamespace Namespace, leftAlias Alias, rightNamespace Namespace, rightAlias Alias) int {
+func compareNamespaceAlias(leftNamespace workspace.Namespace, leftAlias workspace.Alias, rightNamespace workspace.Namespace, rightAlias workspace.Alias) int {
 	if cmp := strings.Compare(string(leftNamespace), string(rightNamespace)); cmp != 0 {
 		return cmp
 	}
 	return strings.Compare(string(leftAlias), string(rightAlias))
 }
 
-func validateKnownStatus(status Status) error {
+func validateKnownStatus(status workspace.Status) error {
 	switch status {
-	case StatusInit, StatusHealthy, StatusFailed:
+	case workspace.StatusInit, workspace.StatusHealthy, workspace.StatusFailed:
 		return nil
 	default:
-		return fmt.Errorf("%w: unknown status %q", ErrInvalidStatusTransition, status)
+		return fmt.Errorf("%w: unknown status %q", workspace.ErrInvalidStatusTransition, status)
 	}
 }
 
-func validateStatusTransition(from Status, to Status) error {
+func validateStatusTransition(from workspace.Status, to workspace.Status) error {
 	switch {
-	case from == StatusInit && to == StatusInit:
+	case from == workspace.StatusInit && to == workspace.StatusInit:
 		return nil
-	case from == StatusInit && (to == StatusHealthy || to == StatusFailed):
+	case from == workspace.StatusInit && (to == workspace.StatusHealthy || to == workspace.StatusFailed):
 		return nil
-	case from == StatusHealthy && to == StatusFailed:
+	case from == workspace.StatusHealthy && to == workspace.StatusFailed:
 		return nil
-	case from == StatusFailed && to == StatusHealthy:
+	case from == workspace.StatusFailed && to == workspace.StatusHealthy:
 		return nil
 	default:
-		return fmt.Errorf("%w: %q -> %q", ErrInvalidStatusTransition, from, to)
+		return fmt.Errorf("%w: %q -> %q", workspace.ErrInvalidStatusTransition, from, to)
 	}
 }
 
-func validateImmutableFields(existing Workspace, updated Workspace) error {
+func validateImmutableFields(existing workspace.Workspace, updated workspace.Workspace) error {
 	if existing.Namespace != updated.Namespace {
 		return fmt.Errorf("workspace update %q: namespace is immutable", existing.ID)
 	}
@@ -374,9 +383,9 @@ func validateImmutableFields(existing Workspace, updated Workspace) error {
 	return nil
 }
 
-func cloneWorkspace(w Workspace) Workspace {
+func cloneWorkspace(w workspace.Workspace) workspace.Workspace {
 	w.InfraOptions = cloneOptions(w.InfraOptions)
-	w.InstallParams = cloneMapAny(w.InstallParams)
+	w.InstallParams = cloneWorkspaceMapAny(w.InstallParams)
 	w.Plugins = cloneAttachedPlugins(w.Plugins)
 	w.StatusError = cloneError(w.StatusError)
 	w.Labels = cloneLabels(w.Labels)
@@ -389,27 +398,27 @@ func cloneOptions(in map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
-		out[k] = deepCloneAny(v)
+		out[k] = deepCloneWorkspaceAny(v)
 	}
 	return out
 }
 
-func cloneMapAny(in map[string]any) map[string]any {
+func cloneWorkspaceMapAny(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
-		out[k] = deepCloneAny(v)
+		out[k] = deepCloneWorkspaceAny(v)
 	}
 	return out
 }
 
-func cloneAttachedPlugins(in []AttachedPlugin) []AttachedPlugin {
+func cloneAttachedPlugins(in []workspace.AttachedPlugin) []workspace.AttachedPlugin {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]AttachedPlugin, len(in))
+	out := make([]workspace.AttachedPlugin, len(in))
 	copy(out, in)
 	for i := range out {
 		out[i].PlacedPaths = slices.Clone(out[i].PlacedPaths)
@@ -417,7 +426,7 @@ func cloneAttachedPlugins(in []AttachedPlugin) []AttachedPlugin {
 	return out
 }
 
-func cloneError(in *Error) *Error {
+func cloneError(in *workspace.Error) *workspace.Error {
 	if in == nil {
 		return nil
 	}
@@ -436,14 +445,14 @@ func cloneLabels(in map[string]string) map[string]string {
 	return out
 }
 
-func deepCloneAny(v any) any {
+func deepCloneWorkspaceAny(v any) any {
 	switch x := v.(type) {
 	case map[string]any:
-		return cloneMapAny(x)
+		return cloneWorkspaceMapAny(x)
 	case []any:
 		out := make([]any, len(x))
 		for i := range x {
-			out[i] = deepCloneAny(x[i])
+			out[i] = deepCloneWorkspaceAny(x[i])
 		}
 		return out
 	default:

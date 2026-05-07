@@ -21,15 +21,16 @@ import (
 	"github.com/AiRanthem/ANA/pkg/manager/infraops"
 	"github.com/AiRanthem/ANA/pkg/manager/plugin"
 	"github.com/AiRanthem/ANA/pkg/manager/workspace"
+	"github.com/AiRanthem/ANA/pkg/storage/memory"
 )
 
 func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 	t.Parallel()
 
 	builder := NewBuilder()
-	builder.PluginRepository = plugin.NewMemoryRepository()
-	builder.PluginStorage = plugin.NewMemoryStorage()
-	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.PluginRepository = memory.NewPluginRepository()
+	builder.PluginStorage = memory.NewPluginStorage()
+	builder.WorkspaceRepository = memory.NewWorkspaceRepository()
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_test"),
 		nextWorkspaceID: WorkspaceID("wsp_test"),
@@ -42,9 +43,9 @@ func TestBuilderBuildRejectsDuplicateRegistrationsAndReuse(t *testing.T) {
 	}
 
 	builder = NewBuilder()
-	builder.PluginRepository = plugin.NewMemoryRepository()
-	builder.PluginStorage = plugin.NewMemoryStorage()
-	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.PluginRepository = memory.NewPluginRepository()
+	builder.PluginStorage = memory.NewPluginStorage()
+	builder.WorkspaceRepository = memory.NewWorkspaceRepository()
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_test"),
 		nextWorkspaceID: WorkspaceID("wsp_test"),
@@ -71,9 +72,9 @@ func TestManagerStop_SecondCallSucceedsIdempotently(t *testing.T) {
 	t.Parallel()
 
 	builder := NewBuilder()
-	builder.PluginRepository = plugin.NewMemoryRepository()
-	builder.PluginStorage = plugin.NewMemoryStorage()
-	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.PluginRepository = memory.NewPluginRepository()
+	builder.PluginStorage = memory.NewPluginStorage()
+	builder.WorkspaceRepository = memory.NewWorkspaceRepository()
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_test"),
 		nextWorkspaceID: WorkspaceID("wsp_test"),
@@ -200,10 +201,10 @@ func TestManagerCreateWorkspace_SubmitFailureDeletesRowWithoutStatusWrite(t *tes
 var errForcedWorkspaceDeleteCompensation = errors.New("forced workspace delete failure")
 
 type failWorkspaceDeleteRepo struct {
-	*workspace.MemoryRepository
+	*memory.WorkspaceRepository
 }
 
-func (*failWorkspaceDeleteRepo) Delete(context.Context, workspace.WorkspaceID) error {
+func (r *failWorkspaceDeleteRepo) Delete(ctx context.Context, id workspace.WorkspaceID) error {
 	return errForcedWorkspaceDeleteCompensation
 }
 
@@ -211,7 +212,7 @@ func TestManagerCreateWorkspace_SubmitFailure_CompensatingDeleteFails_JoinsError
 	t.Parallel()
 
 	managerInstance := newTestManager(t, testManagerOptions{
-		workspaceRepo: &failWorkspaceDeleteRepo{MemoryRepository: workspace.NewMemoryRepository()},
+		workspaceRepo: &failWorkspaceDeleteRepo{WorkspaceRepository: memory.NewWorkspaceRepository()},
 	})
 	pluginBody := buildPluginZip(t, "demo-plugin", "body")
 	plug, err := managerInstance.CreatePlugin(context.Background(), CreatePluginRequest{
@@ -251,9 +252,9 @@ func TestManagerCreateWorkspace_SubmitFailure_CompensatingDeleteFails_JoinsError
 func TestManagerDeletePlugin_StorageDeleteFailureStillDeletesRepository(t *testing.T) {
 	t.Parallel()
 
-	inner := plugin.NewMemoryStorage()
+	inner := memory.NewPluginStorage()
 	managerInstance := newTestManager(t, testManagerOptions{
-		pluginStorage: errOnPluginStorageDelete{MemoryStorage: inner},
+		pluginStorage: errOnPluginStorageDelete{PluginStorage: inner},
 	})
 
 	body := buildPluginZip(t, "hold-repo", "blob")
@@ -277,8 +278,8 @@ func TestManagerDeletePlugin_StorageDeleteFailureStillDeletesRepository(t *testi
 func TestManagerDeletePlugin_RepositoryDeleteFailureDoesNotDeleteBlobOrMetadata(t *testing.T) {
 	t.Parallel()
 
-	stor := plugin.NewMemoryStorage()
-	repoWrap := &errOnPluginRepoDelete{MemoryRepository: plugin.NewMemoryRepository()}
+	stor := memory.NewPluginStorage()
+	repoWrap := &errOnPluginRepoDelete{PluginRepository: memory.NewPluginRepository()}
 	managerInstance := newTestManager(t, testManagerOptions{
 		pluginRepo:    repoWrap,
 		pluginStorage: stor,
@@ -311,7 +312,7 @@ func TestManagerDeletePlugin_StorageNotFoundStillDeletesRepository(t *testing.T)
 	t.Parallel()
 
 	managerInstance := newTestManager(t, testManagerOptions{
-		pluginStorage: notFoundPluginStorageDelete{MemoryStorage: plugin.NewMemoryStorage()},
+		pluginStorage: notFoundPluginStorageDelete{PluginStorage: memory.NewPluginStorage()},
 	})
 
 	body := buildPluginZip(t, "orphan-meta", "blob")
@@ -395,10 +396,10 @@ func TestManagerCreatePluginUpsertsByNamespaceAndName(t *testing.T) {
 }
 
 type alwaysFailPluginUpdateRepo struct {
-	*plugin.MemoryRepository
+	*memory.PluginRepository
 }
 
-func (alwaysFailPluginUpdateRepo) Update(context.Context, plugin.Plugin) error {
+func (r alwaysFailPluginUpdateRepo) Update(ctx context.Context, p plugin.Plugin) error {
 	return errors.New("forced plugin repository update failure")
 }
 
@@ -406,7 +407,7 @@ func TestManagerCreatePluginOverwriteRollbackOnRepositoryUpdateFailure(t *testin
 	t.Parallel()
 
 	managerInstance := newTestManager(t, testManagerOptions{
-		pluginRepo: &alwaysFailPluginUpdateRepo{MemoryRepository: plugin.NewMemoryRepository()},
+		pluginRepo: &alwaysFailPluginUpdateRepo{PluginRepository: memory.NewPluginRepository()},
 	})
 
 	firstBody := buildPluginZip(t, "demo-plugin", "first-body")
@@ -465,9 +466,9 @@ func TestManagerCreateWorkspaceRejectsDuplicateLocaldirDir(t *testing.T) {
 	t.Parallel()
 
 	builder := NewBuilder()
-	builder.PluginRepository = plugin.NewMemoryRepository()
-	builder.PluginStorage = plugin.NewMemoryStorage()
-	builder.WorkspaceRepository = workspace.NewMemoryRepository()
+	builder.PluginRepository = memory.NewPluginRepository()
+	builder.PluginStorage = memory.NewPluginStorage()
+	builder.WorkspaceRepository = memory.NewWorkspaceRepository()
 	builder.IDGenerator = &sequenceIDGenerator{
 		pluginID: PluginID("plg_fixed"),
 		workspaceIDs: []WorkspaceID{
@@ -554,13 +555,13 @@ func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing
 	// closes the workspace repository; this wrapper's Close is a no-op so the
 	// compensating Delete can still run on the underlying MemoryRepository.
 
-	pluginRepo := plugin.NewMemoryRepository()
-	pluginStorage := plugin.NewMemoryStorage()
-	innerWS := workspace.NewMemoryRepository()
+	pluginRepo := memory.NewPluginRepository()
+	pluginStorage := memory.NewPluginStorage()
+	innerWS := memory.NewWorkspaceRepository()
 	pauseRepo := &pauseInsertWorkspaceRepo{
-		MemoryRepository: innerWS,
-		insertDone:       make(chan struct{}),
-		allowProceed:     make(chan struct{}),
+		WorkspaceRepository: innerWS,
+		insertDone:          make(chan struct{}),
+		allowProceed:        make(chan struct{}),
 	}
 
 	spec := &fakeAgentSpec{}
@@ -650,14 +651,14 @@ func TestManagerCreateWorkspace_DeletesRowWhenSubmitFailsWithShutdown(t *testing
 // Close is a no-op so Manager.Stop does not mark the inner MemoryRepository
 // closed before CreateWorkspace's compensating Delete runs.
 type pauseInsertWorkspaceRepo struct {
-	*workspace.MemoryRepository
+	*memory.WorkspaceRepository
 	insertOnce   sync.Once
 	insertDone   chan struct{}
 	allowProceed chan struct{}
 }
 
 func (r *pauseInsertWorkspaceRepo) Insert(ctx context.Context, w workspace.Workspace) error {
-	if err := r.MemoryRepository.Insert(ctx, w); err != nil {
+	if err := r.WorkspaceRepository.Insert(ctx, w); err != nil {
 		return err
 	}
 	r.insertOnce.Do(func() { close(r.insertDone) })
@@ -757,7 +758,7 @@ type testManagerOptions struct {
 
 // errOnPluginStorageDelete wraps MemoryStorage and forces Delete to fail.
 type errOnPluginStorageDelete struct {
-	*plugin.MemoryStorage
+	*memory.PluginStorage
 }
 
 func (errOnPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
@@ -766,7 +767,7 @@ func (errOnPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
 
 // errOnPluginRepoDelete wraps MemoryRepository and forces Delete to fail.
 type errOnPluginRepoDelete struct {
-	*plugin.MemoryRepository
+	*memory.PluginRepository
 }
 
 func (r *errOnPluginRepoDelete) Delete(ctx context.Context, id plugin.PluginID) error {
@@ -775,7 +776,7 @@ func (r *errOnPluginRepoDelete) Delete(ctx context.Context, id plugin.PluginID) 
 
 // notFoundPluginStorageDelete wraps MemoryStorage and makes Delete return ErrStorageNotFound.
 type notFoundPluginStorageDelete struct {
-	*plugin.MemoryStorage
+	*memory.PluginStorage
 }
 
 func (notFoundPluginStorageDelete) Delete(context.Context, plugin.PluginID) error {
@@ -796,17 +797,17 @@ func newTestManager(t *testing.T, opts testManagerOptions) Manager {
 	if opts.pluginRepo != nil {
 		builder.PluginRepository = opts.pluginRepo
 	} else {
-		builder.PluginRepository = plugin.NewMemoryRepository()
+		builder.PluginRepository = memory.NewPluginRepository()
 	}
 	if opts.pluginStorage != nil {
 		builder.PluginStorage = opts.pluginStorage
 	} else {
-		builder.PluginStorage = plugin.NewMemoryStorage()
+		builder.PluginStorage = memory.NewPluginStorage()
 	}
 	if opts.workspaceRepo != nil {
 		builder.WorkspaceRepository = opts.workspaceRepo
 	} else {
-		builder.WorkspaceRepository = workspace.NewMemoryRepository()
+		builder.WorkspaceRepository = memory.NewWorkspaceRepository()
 	}
 	builder.IDGenerator = fixedIDGenerator{
 		nextPluginID:    PluginID("plg_fixed"),
