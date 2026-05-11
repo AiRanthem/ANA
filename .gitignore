@@ -33,3 +33,4 @@ go.work.sum
 .codex
 .vscode
 .cursor/settings.json
+.pro
