@@ -727,6 +727,7 @@ type Event struct {
     SessionID  SessionID  // empty when type == task.*
     RequestID  RequestID  // empty when type == task.* / session.*
     Type       EventType
+    Seq        uint64     // monotonic per (task, session, request); audit and bus use the same width
     OccurredAt time.Time
     Payload    EventPayload // typed per Type
 }
@@ -765,7 +766,7 @@ post-Salutation or stripped user payload.
 | `Kind`          | `TranscriptKind` | input / output / event_summary |
 | `Content`       | `[]byte`         | JSON for `input` and `event_summary`; UTF-8 text for `output` |
 | `ContentType`   | `string`         | `text/plain` / `application/json` |
-| `Seq`           | `int`            | Monotonic per (task, session, request) |
+| `Seq`           | `uint64`         | Monotonic per (task, session, request) |
 | `Schema`        | `string`         | Schema version label for forward compat (`v1`) |
 | `CreatedAt`     | `time.Time`      |       |
 

@@ -17,10 +17,15 @@ the engine or invoker, and it drops events under back-pressure.
 - `Subscription` interface:
   - `Events() <-chan Event`
   - `Errors() <-chan error` — surface non-fatal subscriber issues
+  - `Dropped() uint64` — cumulative count of events dropped for this subscriber
   - `Close() error`
 - `SubscribeOptions`:
   - `TaskID TaskID` — required; subscribers always scope to one task in
     v1. (Cross-task subscriptions are a v2 extension.)
+  - `SessionID SessionID` — optional; when set, only matching session
+    events are delivered.
+  - `RequestID RequestID` — optional; when set, only matching request
+    events are delivered. This is normally paired with `SessionID`.
   - `BufferSize int` — per-subscriber channel size; defaults to 256.
   - `IncludeChunks bool` — if false (default), `request.text_chunk` is
     suppressed; useful for slow consumers.
@@ -36,7 +41,8 @@ the engine or invoker, and it drops events under back-pressure.
 - The caller of `Publish` is the owning component after a successful
   `audit.Sink.WriteEvent`. `Publish` does not write audit records itself.
 - `Publish` enqueues the event to every active subscriber for the given
-  `task_id` (subscribers scoped to a different task ignore the publish).
+  `task_id` whose optional `session_id` and `request_id` filters also
+  match.
 - For each subscriber, if its channel buffer is full, the event is
   dropped for that subscriber and the dropped counter is incremented.
 - `Publish` never blocks. The engine and invoker rely on this property.
@@ -61,17 +67,21 @@ the engine or invoker, and it drops events under back-pressure.
 
 - v1 uses pure non-blocking buffered channels per subscriber. No coalescing
   of chunk events.
-- Dropped counts are published on `Errors()` periodically (e.g., every 1
-  second per subscriber) so consumers know they fell behind.
+- A drop produces a `SubscriberLaggedError` pushed inline onto the
+  subscriber's `Errors()` channel. When that channel (buffer size 1) is
+  full, the bus drops the older notification and replaces it with the
+  newer one — consumers always see the latest cumulative `Dropped()`
+  count, never a stale one. They may miss intermediate counts.
 - The bus does not implement backoff or rate limiting in v1.
 
 ## Subscriber concurrency
 
-- Each subscriber runs in its own goroutine started by `Subscribe`.
-- The goroutine forwards events from the bus's internal queue to the
-  subscriber's channel. On subscriber close, it drains and exits.
-- The bus tracks subscribers under an `sync.Map` keyed by `(TaskID,
-  subscriberID)`.
+- Each subscriber owns a bounded event channel. `Publish` uses
+  non-blocking sends to those channels and never waits for consumers to
+  read.
+- The bus tracks subscribers under a mutex keyed by `(TaskID,
+  subscriberID)`. Subscription close is idempotent and safe to race with
+  publish.
 
 ## Edge cases & decisions
 
@@ -79,19 +89,22 @@ the engine or invoker, and it drops events under back-pressure.
   drop counter. Drops are independent.
 - Subscribing after the task ended: returns `ErrSubscribeUnknownTask`. The
   caller can fall back to `Wait` for the final result.
-- Publishing with `task_id == ""`: the bus rejects the publish. All
-  events must be task-scoped.
+- Publishing with `task_id == ""`: the bus ignores the publish (zero
+  delivered, zero dropped). The `Bus.Publish` signature has no error
+  return because publishers are best-effort; callers MUST validate
+  `task_id` before invoking. Same for an already-cancelled `ctx`.
 - Engine shutdown: `Bus.Close` is called by the orchestrator's shutdown
   path; existing subscribers see channel close.
 
-## Tests to write (no implementation in this pass)
+## Tests
 
 1. Subscribe → Publish → Events delivered in order.
 2. Slow subscriber drops events, fast subscriber does not.
 3. `IncludeChunks = false` filters out `request.text_chunk` events.
 4. Task terminal closes subscriber channel.
 5. Subscribe after terminal returns `ErrSubscribeUnknownTask`.
-6. Concurrent publishers and subscribers under `-race`.
+6. Session/request scoped subscribers receive only matching events.
+7. Concurrent publishers and subscribers under `-race`.
 
 ## Out of scope
 
