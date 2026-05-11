@@ -15,7 +15,9 @@ is to receive such Epistolary inputs from the user, route them to the correct
 workspace, drive the resulting delegation chain, return the leaf output back up
 the stack, and finally deliver it to the user.
 
-`pkg/orchestrator` owns this routing and chaining loop. It sits above
+`pkg/orchestrator` owns this routing and chaining loop. Root user messages
+either carry an explicit Salutation or use the registry's explicit default
+workspace policy. It sits above
 `pkg/agentio` (canonical request/event/session contracts) and `pkg/bridge/...`
 (transport adapters), and below the ingress layer (IM bridges, web APIs,
 schedulers, webhooks).
@@ -25,7 +27,8 @@ schedulers, webhooks).
 - One internal pipeline that handles every ingress form once it is normalized
   into `MessageEnvelope`.
 - Strict, prompt-native routing via the first non-empty line directive
-  `{to #<alias>}` (the **Salutation**).
+  `{to #<alias>}` (the **Salutation**), plus explicit default-workspace
+  routing for root user input that has no Salutation.
 - A first-class **Task** for every user request, with traceable
   `(task_id, session_id, request_id)` triples for every transport call.
 - A first-class **Session** lifecycle that mirrors a workspace's continuous
@@ -81,16 +84,18 @@ is always stripped before forwarding.
 
 ### 2.2 Task
 
-A **Task** is the entire call tree triggered by one user Epistolary input. It
-ends when the engine produces the final plain output addressed back to the
-caller (the user). A Task owns:
+A **Task** is the entire call tree triggered by one user input. It ends when
+the engine produces the final plain output addressed back to the caller (the
+user). A Task owns:
 
 - A unique `task_id`.
 - A `MessageEnvelope` (the original normalized user input).
 - A session tree (sessions plus parent-session edges).
 - A stream of lifecycle events (live + audit).
 - A final `Result` (or terminal error) once finished.
-- A cancellation `context.Context` rooted at submission time.
+- A cancellation `context.Context` rooted at the orchestrator root context
+  and stopped only by task completion, orchestrator shutdown, or
+  `Cancel(taskID)`.
 
 ### 2.3 Session
 
@@ -192,7 +197,10 @@ type Snapshot struct { /* see §6.6 */ }
 type Orchestrator interface {
     // Submit creates a Task, wires up its event stream, and returns
     // immediately. The Task continues to run in the background until it
-    // completes, fails, or is cancelled.
+    // completes, fails, or is cancelled. ctx controls only the submission
+    // transaction: validation, task creation, and the synchronous
+    // task.created audit/event emission. After Submit returns, task
+    // lifetime is controlled by the orchestrator root context and Cancel.
     Submit(ctx context.Context, env MessageEnvelope) (TaskID, error)
 
     // Subscribe attaches a best-effort live event subscriber. Slow
@@ -202,7 +210,7 @@ type Orchestrator interface {
 
     // Wait blocks until the Task reaches a terminal state and returns
     // the final Result. Cancelling ctx detaches Wait but does not cancel
-    // the Task; use Cancel for that.
+    // the Task or any in-flight Request; use Cancel for that.
     Wait(ctx context.Context, id TaskID) (Result, error)
 
     // Cancel transitions the Task toward cancelled. In-flight transport
@@ -320,7 +328,7 @@ Submit() →  │ pending  │
               │ │ completed  │
               │ └────────────┘
               │
-              │ stack still has frames AND ctx done
+              │ stack still has frames AND runtime ctx done
               ▼
               ┌───────────┐
               │ cancelled │
@@ -418,11 +426,22 @@ Routing rules (`protocol/PLAN.md` for parser specifics):
 
 - Only the first non-empty line is inspected.
 - `{to #<alias>}` MUST be the very first non-whitespace token of that line.
+- If the first non-empty line begins with a valid `{to #<alias>}`, the root
+  input and agent output both use explicit routing to that alias.
 - Whitespace and any inline payload after the directive on the same line are
   trimmed and prepended to the rest of the body.
 - A first-line beginning with `to ` (loose form) but failing the strict
   Salutation regex is rejected as `ErrInvalidRouteDirective`. We do not fall
   back to "treat as plain text" to avoid silent route failures.
+- For root user input with no Salutation, the engine MUST call
+  `registry.Default`. If the registry has exactly one explicit default
+  workspace, the task routes to that workspace as a default route. If the
+  registry has no default workspace, the task fails fast with
+  `registry.ErrNoDefaultWorkspace`. Root input without a Salutation is never
+  silently treated as a plain-text fallback.
+- Every default route MUST emit a `route.directive` event and audit record
+  before opening the root session. The event payload identifies the selected
+  workspace and marks the route as `is_explicit=false`.
 
 ### 6.3 `Workspace` (`registry/`)
 
@@ -521,7 +540,7 @@ import `idgen`; they MUST NOT import the root package to obtain them
 
 ## 7. Required Upstream Contract Changes
 
-The orchestrator design depends on three concrete extensions to existing
+The orchestrator design depends on concrete extensions to existing
 packages. These are NOT implemented in this design pass; they are surfaced
 here so the orchestrator implementation can rely on them, and so a separate
 work-package can land them.
@@ -604,11 +623,15 @@ calls and trust that the adapter handles continuity.
 
 1. Land `pkg/agentio` per-part role.
 2. Land `pkg/bridge/cli` `BuildArgs`.
-3. Land `pkg/bridge/rest.HistoryStore` and `pkg/bridge/socket.SessionPool`.
-4. Implement `pkg/orchestrator` per the per-module PLANs.
+3. Land `pkg/bridge/rest.HistoryStore`.
+4. Land `pkg/bridge/socket.SessionPool` and the drain-before-close behavior
+   in §7.5.
+5. Integrate the root orchestrator engine with real bridge-backed agents.
 
-The orchestrator implementation can mock these contracts during early tests
-but the integration tests against real bridges block on (1)–(3) shipping.
+Root engine integration against real bridges MUST NOT start before (1)–(4)
+are complete. Until those upstream contracts are complete, engine tests MUST
+use fake `agentio.Agent` implementations and MUST NOT depend on
+`pkg/bridge/cli`, `pkg/bridge/rest`, or `pkg/bridge/socket` behavior.
 
 ### 7.5 Bridge transport invariants (correctness guarantees)
 
@@ -639,44 +662,59 @@ subprocess hygiene. They complement the structural extensions in §7.2–§7.3.
 
 ## 8. Event Taxonomy
 
-Two channels share an event-type namespace. All events are emitted by the
-engine and dispatched in this order:
+Two channels share an event-type namespace. Every event is dispatched in this
+order by its owning component:
 
 1. `audit.Sink` (synchronous, must succeed).
 2. `events.Bus` (asynchronous, best-effort).
 
+Ownership is exclusive:
+
+- The engine owns `task.*`, `session.*`, `route.directive`, and every
+  task-level or route-level lifecycle event.
+- The invoker owns `request.*`, streaming chunk events, and request
+  transcript records.
+- The engine creates and stores `Request` records, then delegates all
+  request lifecycle event emission to the invoker. The engine MUST NOT emit
+  `request.created`, `request.running`, `request.completed`,
+  `request.failed`, or `request.text_chunk`.
+- The invoker MUST NOT emit `task.*`, `session.*`, or `route.directive`.
+- No component emits the same logical request lifecycle event twice.
+
 Failure semantics:
 
-- If `audit.Sink` returns an error, the engine fails the current Request and
-  transitions the session and task to `failed`. This is the primary
-  back-pressure path.
+- If `audit.Sink` returns an error, the owning component stops dispatch. For
+  request-owned events the invoker returns `ErrAuditSink`; the engine then
+  marks the current Request, session, and task as `failed`. This is the
+  primary back-pressure path.
 - If `events.Bus` drops a message (e.g., subscriber buffer full), the bus
-  records a metric counter but the engine proceeds.
+  records a metric counter and the owning component proceeds.
 
 ### 8.1 Event types
 
-| Type                   | Trigger                                                           |
-|------------------------|-------------------------------------------------------------------|
-| `task.created`         | Synchronously inside `Submit`, before it returns the TaskID; if the audit sink rejects, `Submit` returns an error and no TaskID is exposed |
-| `task.running`         | When the engine begins driving the first session                  |
-| `task.completed`       | Stack drained with success                                        |
-| `task.failed`          | Any unrecoverable error                                           |
-| `task.cancelled`       | `Cancel` called or context expired                                |
-| `session.opened`       | Engine pushes a session onto the stack                            |
-| `session.paused`       | Salutation found in current session output                        |
-| `session.resumed`      | Engine re-issues a Request to a previously paused session         |
-| `session.closed`       | Engine pops the session                                           |
-| `session.failed`       | Request inside the session terminally failed                      |
-| `request.created`      | Right before the invoker dispatches                               |
-| `request.running`      | Invoker received the first event from the bridge                  |
-| `request.completed`    | Stream EOF with success                                           |
-| `request.failed`       | Stream EOF with error / ctx cancel                                |
-| `request.text_chunk`   | Aggregated text delta (best-effort live, not on audit)            |
-| `route.directive`      | Salutation parsed from incoming envelope or agent output          |
+| Type                   | Owner   | Trigger                                                           |
+|------------------------|---------|-------------------------------------------------------------------|
+| `task.created`         | engine  | Synchronously inside `Submit`, before it returns the TaskID; if the audit sink rejects, `Submit` returns an error and no TaskID is exposed |
+| `task.running`         | engine  | When the engine begins driving the first session                  |
+| `task.completed`       | engine  | Stack drained with success                                        |
+| `task.failed`          | engine  | Any unrecoverable error                                           |
+| `task.cancelled`       | engine  | `Cancel` called or orchestrator root context stopped              |
+| `session.opened`       | engine  | Engine pushes a session onto the stack                            |
+| `session.paused`       | engine  | Salutation found in current session output                        |
+| `session.resumed`      | engine  | Engine re-issues a Request to a previously paused session         |
+| `session.closed`       | engine  | Engine pops the session                                           |
+| `session.failed`       | engine  | Request inside the session terminally failed                      |
+| `request.created`      | invoker | Right before the invoker dispatches                               |
+| `request.running`      | invoker | Invoker received the first event from the bridge                  |
+| `request.completed`    | invoker | Stream EOF with success                                           |
+| `request.failed`       | invoker | Stream EOF with error / ctx cancel                                |
+| `request.text_chunk`   | invoker | Aggregated text delta from the bridge stream                      |
+| `route.directive`      | engine  | Explicit Salutation parsed or default route selected              |
 
-The `request.text_chunk` event is **bus-only** to avoid flooding the audit
-log with per-token chunks. Audit gets the aggregated `OutputText` once the
-request completes (see §9).
+`request.text_chunk` is a normal event for ordering purposes: the invoker
+writes it to the audit sink first, then publishes it to the event bus. The
+audit sink also receives the aggregated output transcript when the Request
+closes (see §9).
 
 ### 8.2 Event schema
 
@@ -703,8 +741,8 @@ The audit sink is the canonical record of "every transport call and every
 transcript boundary". It is required (no nullable). Implementations may write
 to file, database, or a remote pipeline, but must satisfy:
 
-- **Completeness:** every event listed in §8.1 except `request.text_chunk`
-  MUST be delivered.
+- **Completeness:** every event listed in §8.1 MUST be delivered, including
+  streaming chunk events.
 - **Ordering:** events for the same `task_id` are delivered in the order they
   were generated. Cross-task ordering is best-effort.
 - **Synchronous semantics:** `Sink.WriteEvent` and `Sink.WriteTranscript`
@@ -714,7 +752,10 @@ to file, database, or a remote pipeline, but must satisfy:
   the same logical step, but implementations are encouraged to dedup on
   `EventID` for safety.
 
-In addition to event records, the audit sink receives transcript records:
+In addition to event records, the audit sink receives transcript records.
+Audit transcript input records MUST capture the fully rendered
+`agentio.InvokeRequest` in an auditable shape. They MUST NOT store only the
+post-Salutation or stripped user payload.
 
 | Field           | Type             | Notes |
 |-----------------|------------------|-------|
@@ -722,18 +763,39 @@ In addition to event records, the audit sink receives transcript records:
 | `SessionID`     | `SessionID`      |       |
 | `RequestID`     | `RequestID`      |       |
 | `Kind`          | `TranscriptKind` | input / output / event_summary |
-| `Content`       | `[]byte`         | UTF-8 text or JSON depending on Kind |
+| `Content`       | `[]byte`         | JSON for `input` and `event_summary`; UTF-8 text for `output` |
 | `ContentType`   | `string`         | `text/plain` / `application/json` |
 | `Seq`           | `int`            | Monotonic per (task, session, request) |
 | `Schema`        | `string`         | Schema version label for forward compat (`v1`) |
 | `CreatedAt`     | `time.Time`      |       |
 
-The orchestrator persists three transcript records per Request:
+The orchestrator persists these transcript records per Request:
 
-1. `input` — the user-visible payload sent to the agent (no Notes preamble;
-   that is reproducible from registry state).
+1. `input` — a canonical JSON document representing the fully rendered
+   `agentio.InvokeRequest` sent to the agent.
 2. `output` — the agent's raw output text (Salutation included if any).
 3. `event_summary` — a JSON blob summarizing usage, error, finish reason.
+
+The `input` transcript content MUST include:
+
+- `TaskID`, `SessionID`, and `RequestID`.
+- Target workspace identity: `workspace_id`, `workspace_alias`, and the
+  resolved agent identity/factory key used for the call.
+- Runtime metadata: `runtime_type` and `runtime_kind`.
+- Final input parts in order, with each part's role, kind, content or stable
+  content reference, and byte/size metadata.
+- Attachment metadata for every forwarded attachment, including type, name or
+  reference, size, and digest when available.
+- Prompt builder diagnostics, including Notes inclusion/skipping decisions.
+- Either the registry snapshot used to build the Notes block or a prompt
+  template version plus a stable registry snapshot reference.
+
+Sensitive data handling is a redaction policy, not a reason to omit canonical
+replay structure. The orchestrator applies redaction before it calls
+`Sink.WriteTranscript`; sinks store the emitted record verbatim. Redaction
+MUST preserve field presence, ordering, part roles, attachment metadata, and
+enough stable references or digests for an auditor to understand what was sent
+without silently losing replay-critical information.
 
 The audit sink interface is defined in `audit/PLAN.md`.
 
@@ -752,14 +814,21 @@ The audit sink interface is defined in `audit/PLAN.md`.
 
 ### 10.2 Cancellation
 
-- `Submit` derives a per-task `context.Context` from the caller's ctx that is
-  cancelled when:
-  - the caller's ctx is done, or
-  - `Cancel(taskID)` is called explicitly.
+- `Submit(ctx)` uses `ctx` only for the synchronous submission transaction:
+  validation, task record creation, and the `task.created` audit/event write.
+- A Task's runtime context is derived from the orchestrator root context, not
+  from the `Submit` caller's context. HTTP request contexts, webhook
+  contexts, and other ingress contexts MUST NOT cancel a background Task
+  after `Submit` returns.
+- The Task runtime context is cancelled only when:
+  - the orchestrator root context stops,
+  - `Cancel(taskID)` is called explicitly, or
+  - the task reaches a terminal state and the engine releases resources.
 - The per-task ctx is passed through the invoker into bridge calls, so
   `bridge.cli`, `bridge.rest`, and `bridge.socket` interrupt their I/O.
-- `Wait(ctx, taskID)` decouples the caller's ctx from task lifetime; the
-  caller can stop waiting without cancelling the task.
+- `Wait(ctx, taskID)` decouples the caller's ctx from task lifetime. A waiter
+  ctx cancellation detaches only that waiter; it does not cancel the Task,
+  close the event subscription, or interrupt in-flight bridge I/O.
 
 ### 10.3 Loop protection
 

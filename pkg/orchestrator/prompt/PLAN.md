@@ -28,8 +28,11 @@ Build the role-aware prompt for one Request. Specifically:
   - `IDs IDTriple` — `(TaskID, SessionID, RequestID)`.
 - `BuildOutput`:
   - `Request agentio.InvokeRequest` — final request.
-  - `Diagnostics []string` — optional, for debug logs (e.g., "Notes block
-    skipped on resume").
+  - `Diagnostics []string` — prompt builder diagnostics that the engine
+    passes to the invoker for `transcript.input` audit records (e.g.,
+    "Notes block skipped on resume").
+  - `TemplateVersion string` — stable prompt template version used to render
+    the Request; v1 uses `notes-v1`.
 
 ## Strategy: Role-aware injection
 
@@ -138,7 +141,7 @@ The builder fills `agentio.InvokeRequest` like this:
 | `Options.Stream` | `true` (orchestrator always streams) |
 | `Options.RequestID` | `IDs.RequestID` (string-cast) for echo into events |
 | `Options.Workspace` | `Workspace.WorkspaceID` |
-| `Options.Hints`  | Map containing `runtime_kind`, `kind` (the `RequestKind` value), plus a `task_id` for downstream auditing. Bridges may ignore. |
+| `Options.Hints`  | Map containing `runtime_kind`, `kind` (the `RequestKind` value), `task_id`, and `prompt_template_version` for downstream auditing. Bridges read the keys they support and leave the rest untouched. |
 
 The orchestrator does not set role at the top level; per-part roles drive
 behavior (this is exactly the contract change mandated in `DESIGN.md` §7.1).

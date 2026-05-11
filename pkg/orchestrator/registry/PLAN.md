@@ -43,6 +43,10 @@ ready-to-use `agentio.Agent` for the invoker.
 - Allowed character set per `protocol/PLAN.md` §Alias rules.
 - A registry may carry at most one `IsDefaultEntry == true` workspace. If a
   registration sets `IsDefaultEntry = true`, any prior default is demoted.
+- `Default(ctx)` returns only that explicit default workspace. It does not
+  infer a fallback from registration order or the number of workspaces. If
+  no workspace is marked `IsDefaultEntry`, it returns
+  `ErrNoDefaultWorkspace`.
 
 ### Disable / enable
 
