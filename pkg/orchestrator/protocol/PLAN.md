@@ -12,8 +12,10 @@ it carries a Salutation. Every other module accepts already-parsed
 
 - `ParseDirective(body string) (RouteDirective, error)`
   - Returns `RouteDirective` with `IsExplicit == false` and `TargetAlias ==
-    ""` when the body has no Salutation. This is **not** an error and is
-    used to detect plain output.
+    ""` when the body has no Salutation. This is **not** a parser error.
+    The engine interprets that result by context: agent output is a plain
+    return, while root user input routes to the registry default or fails
+    fast when no default exists.
   - Returns `ErrInvalidRouteDirective` when the first non-empty line begins
     in a way that looks like an attempted Salutation but does not satisfy
     the strict regex (see §Parser rules). The orchestrator surfaces this as
@@ -77,9 +79,10 @@ helper used by `prompt/` to render the example line:
   satisfies the regex; the rest are part of the payload. The example given
   by the spec aligns with this behavior.
 - Empty alias inside braces (`{to #}`) → `ErrInvalidRouteDirective`.
-- A Salutation that is not on the first non-empty line → ignored. Treated
-  as plain output. The agent is expected to put the directive at the very
-  start.
+- A Salutation that is not on the first non-empty line → ignored by the
+  parser. Agent output with this parse result is a plain return. Root user
+  input with this parse result follows the no-Salutation routing policy:
+  explicit default workspace or `registry.ErrNoDefaultWorkspace`.
 - Mixed whitespace before the directive: leading whitespace on the directive
   line is allowed because some agents emit a leading space.
 - CRLF line endings are normalized: the parser splits on either `\n` or

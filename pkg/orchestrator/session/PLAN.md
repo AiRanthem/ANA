@@ -91,9 +91,11 @@ sequence:
 - `Request.running` → `Request.failed` on stream `EventError`, transport
   failure, or context cancellation.
 
-The audit sink and event bus see each transition, but those emissions are
-the invoker's responsibility (see `invoker/PLAN.md`); this package
-exposes only `UpdateRequest` to record the new state.
+The audit sink and event bus see each Request transition, but those
+emissions are the invoker's exclusive responsibility (see
+`invoker/PLAN.md`). The engine and this package update Request records only;
+they do not emit `request.*` events, which prevents duplicate request
+lifecycle events.
 
 ## Persistence
 

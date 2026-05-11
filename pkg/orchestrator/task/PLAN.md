@@ -10,6 +10,11 @@ The engine in the orchestrator root drives Tasks; this package supplies the
 durable representation, the wait primitive, and the per-task cancellation
 plumbing.
 
+`Submit(ctx)` uses the caller's `ctx` only for the submission transaction.
+After `Submit` returns a `TaskID`, the Task lifetime is controlled by the
+orchestrator root context and `Cancel(taskID)`, not by the ingress caller's
+HTTP request context, webhook context, or other short-lived submit context.
+
 ## Public surface (intent only)
 
 - `TaskID` type (string alias re-exported from root `types.go`).
@@ -48,7 +53,7 @@ State machine per `DESIGN.md` §5.1.
 | pending    | running    | Engine begins driving the root session |
 | running    | completed  | Stack drained successfully |
 | running    | failed     | Engine reports terminal error |
-| running    | cancelled  | `Cancel` called or root ctx done |
+| running    | cancelled  | `Cancel` called or orchestrator root ctx done |
 | pending    | cancelled  | `Cancel` called before engine started |
 | pending    | failed     | Validation failure during `Submit` |
 
@@ -57,18 +62,23 @@ State machine per `DESIGN.md` §5.1.
 ## Wait semantics
 
 - `Handle.Wait(ctx)` blocks until the Task reaches a terminal state.
-- Cancelling `ctx` detaches the waiter; the Task continues. This matches
-  `DESIGN.md` §3.
+- Cancelling `ctx` detaches only that waiter; the Task continues, active
+  event subscriptions remain governed by their own contexts, and in-flight
+  bridge I/O is not interrupted. This matches `DESIGN.md` §3.
 - Multiple waiters share the same terminal `Result`; broadcast via a
   `sync.WaitGroup` or closed channel.
 - After terminal state, subsequent `Wait` calls return immediately.
 
 ## Cancellation
 
-- Each Task owns a `context.CancelFunc` derived from its parent ctx.
+- Each Task owns a runtime `context.CancelFunc` derived from the
+  orchestrator root context.
 - `Cancel()` calls the cancel func and updates state to `cancelled` (if
   not already terminal). The engine observes ctx cancellation in the
   invoker and bridge calls and stops issuing new Requests.
+- The `Submit(ctx)` caller's context is not the parent of this runtime
+  context. Cancelling the submit context after `Submit` returns does not
+  cancel the Task.
 - Cancellation is idempotent. `Cancel` after a terminal state returns nil.
 - `Cancel` does not wait for in-flight bridge IO to drain; callers may
   follow up with `Wait` to observe the final state.
@@ -91,10 +101,11 @@ State machine per `DESIGN.md` §5.1.
 
 ## Edge cases & decisions
 
-- `Submit` for an envelope whose body has no Salutation: the orchestrator
-  may elect to route to the default workspace via `registry.Default`. This
-  policy lives in the engine, not in `task/`. The Store sees the envelope
-  unchanged.
+- `Submit` for an envelope whose body has no Salutation: the engine routes
+  to `registry.Default` only when the registry has an explicit default
+  workspace, and emits/audits `route.directive` with `is_explicit=false`.
+  Without a default workspace, the task fails fast with
+  `registry.ErrNoDefaultWorkspace`. The Store sees the envelope unchanged.
 - `Cancel` racing with completion: serialize via the Store's `Update`. The
   loser observes `ErrTaskAlreadyTerminal` and returns nil.
 - `Wait` after the Task expires from the Store (future v2 GC): return

@@ -4,8 +4,9 @@
 
 Best-effort runtime event bus for live subscribers (IM bridges that want
 typing indicators, web SSE, console UIs, etc.). The bus is the
-counterpart of the audit sink: never blocks the engine, may drop events
-under back-pressure.
+counterpart of the audit sink: it receives events only after the owning
+component has written the same event to the audit sink. The bus never blocks
+the engine or invoker, and it drops events under back-pressure.
 
 ## Public surface (intent only)
 
@@ -23,13 +24,17 @@ under back-pressure.
   - `BufferSize int` — per-subscriber channel size; defaults to 256.
   - `IncludeChunks bool` — if false (default), `request.text_chunk` is
     suppressed; useful for slow consumers.
-- `Event` struct per `DESIGN.md` §8.2.
+- `Event` struct per `DESIGN.md` §8.2. Event ownership is defined in
+  `DESIGN.md` §8: engine owns `task.*`, `session.*`, and `route.directive`;
+  invoker owns `request.*`, including streaming chunks.
 - Sentinels: `ErrBusClosed`, `ErrSubscribeUnknownTask`.
 
 ## Behavior
 
 ### Publish path
 
+- The caller of `Publish` is the owning component after a successful
+  `audit.Sink.WriteEvent`. `Publish` does not write audit records itself.
 - `Publish` enqueues the event to every active subscriber for the given
   `task_id` (subscribers scoped to a different task ignore the publish).
 - For each subscriber, if its channel buffer is full, the event is
