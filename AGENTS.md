@@ -59,6 +59,7 @@
 - Delay abstraction until duplication or variation is real and repeated.
 - Keep changes incremental and easy to review.
 - Do not introduce new third-party dependencies without a clear reason; keep `go.mod` / `go.sum` tidy (`go mod tidy`).
+- Prioritize Go's standard library and established mainstream packages; avoid reinventing the wheel.
 
 ## Verify Before Submitting
 Before declaring a change done, run the relevant subset of:
