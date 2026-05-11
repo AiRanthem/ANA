@@ -1,3 +1,9 @@
+// Package registry provides an in-memory catalog of orchestrator workspaces
+// keyed by both stable WorkspaceID and routable Alias, along with the
+// AgentFactory that produces an agentio.Agent for each entry. It is a layer-0
+// catalog: it imports only the canonical pkg/agentio contract and does not
+// depend on root orchestrator, engine, bridge, prompt, invoker, or agent
+// runtime packages.
 package registry
 
 import (
@@ -44,16 +50,49 @@ type Workspace struct {
 	RuntimeConfig  map[string]any
 }
 
+// AgentFactory builds an agentio.Agent for a registered workspace. Implementations
+// receive a defensive copy of the Workspace and must return a non-nil Agent on
+// success. The registry wraps stored factories so a (nil, nil) return surfaces
+// as ErrInvalidWorkspace.
 type AgentFactory func(ctx context.Context, ws Workspace) (agentio.Agent, error)
 
+// Registry is the catalog of workspaces and their AgentFactory bindings. All
+// methods are safe for concurrent use. The ctx parameter is currently unused
+// but reserved for future cancellation/tracing support.
 type Registry interface {
+	// Register stores a new workspace and its factory. Validation and collision
+	// checks complete before any state mutation; on conflict the registry is
+	// left unchanged.
 	Register(ctx context.Context, ws Workspace, factory AgentFactory) error
+
+	// Update replaces a stored workspace's mutable fields while preserving its
+	// AgentFactory binding. The Alias is immutable: an Update that changes it
+	// returns ErrInvalidWorkspace and leaves all state untouched. Setting
+	// IsDefaultEntry promotes this workspace and demotes any previous default;
+	// clearing it on the current default unsets the registry's default.
 	Update(ctx context.Context, ws Workspace) error
+
+	// Disable marks a workspace as disabled. Subsequent lookups return
+	// ErrWorkspaceDisabled. Idempotent for existing IDs.
 	Disable(ctx context.Context, workspaceID string) error
+
+	// Enable clears the disabled flag. Idempotent for existing IDs.
 	Enable(ctx context.Context, workspaceID string) error
+
+	// LookupByAlias returns a clone of the workspace and its wrapped factory.
+	// Returns ErrAliasNotFound or ErrWorkspaceDisabled when applicable.
 	LookupByAlias(ctx context.Context, alias string) (Workspace, AgentFactory, error)
+
+	// LookupByID returns a clone of the workspace and its wrapped factory.
+	// Returns ErrWorkspaceNotFound or ErrWorkspaceDisabled when applicable.
 	LookupByID(ctx context.Context, workspaceID string) (Workspace, AgentFactory, error)
+
+	// Default returns the workspace marked as the current default. Returns
+	// ErrNoDefaultWorkspace when no default has been set.
 	Default(ctx context.Context) (Workspace, AgentFactory, error)
+
+	// List returns clones of every registered workspace (enabled and disabled)
+	// sorted by Alias for deterministic output.
 	List(ctx context.Context) ([]Workspace, error)
 }
 
@@ -74,15 +113,15 @@ func NewMemory() *MemoryRegistry {
 }
 
 func (r *MemoryRegistry) Register(ctx context.Context, ws Workspace, factory AgentFactory) error {
-	_ = ctx
+	trimmedID := strings.TrimSpace(ws.WorkspaceID)
 
 	if factory == nil {
-		return fmt.Errorf("register workspace %q: %w", strings.TrimSpace(ws.WorkspaceID), ErrInvalidWorkspace)
+		return fmt.Errorf("register workspace %q: %w", trimmedID, ErrInvalidWorkspace)
 	}
 
 	normalized, err := validateWorkspace(ws)
 	if err != nil {
-		return fmt.Errorf("register workspace %q: %w", strings.TrimSpace(ws.WorkspaceID), err)
+		return fmt.Errorf("register workspace %q: %w", trimmedID, err)
 	}
 
 	r.mu.Lock()
@@ -115,8 +154,6 @@ func (r *MemoryRegistry) Register(ctx context.Context, ws Workspace, factory Age
 }
 
 func (r *MemoryRegistry) Update(ctx context.Context, ws Workspace) error {
-	_ = ctx
-
 	normalized, err := validateWorkspace(ws)
 	if err != nil {
 		return fmt.Errorf("update workspace %q: %w", strings.TrimSpace(ws.WorkspaceID), err)
@@ -152,8 +189,6 @@ func (r *MemoryRegistry) Update(ctx context.Context, ws Workspace) error {
 }
 
 func (r *MemoryRegistry) Disable(ctx context.Context, workspaceID string) error {
-	_ = ctx
-
 	trimmedID := strings.TrimSpace(workspaceID)
 
 	r.mu.Lock()
@@ -173,8 +208,6 @@ func (r *MemoryRegistry) Disable(ctx context.Context, workspaceID string) error 
 }
 
 func (r *MemoryRegistry) Enable(ctx context.Context, workspaceID string) error {
-	_ = ctx
-
 	trimmedID := strings.TrimSpace(workspaceID)
 
 	r.mu.Lock()
@@ -194,8 +227,6 @@ func (r *MemoryRegistry) Enable(ctx context.Context, workspaceID string) error {
 }
 
 func (r *MemoryRegistry) LookupByAlias(ctx context.Context, alias string) (Workspace, AgentFactory, error) {
-	_ = ctx
-
 	trimmedAlias := strings.TrimSpace(alias)
 
 	r.mu.RLock()
@@ -210,8 +241,6 @@ func (r *MemoryRegistry) LookupByAlias(ctx context.Context, alias string) (Works
 }
 
 func (r *MemoryRegistry) LookupByID(ctx context.Context, workspaceID string) (Workspace, AgentFactory, error) {
-	_ = ctx
-
 	trimmedID := strings.TrimSpace(workspaceID)
 
 	r.mu.RLock()
@@ -221,8 +250,6 @@ func (r *MemoryRegistry) LookupByID(ctx context.Context, workspaceID string) (Wo
 }
 
 func (r *MemoryRegistry) Default(ctx context.Context) (Workspace, AgentFactory, error) {
-	_ = ctx
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -234,8 +261,6 @@ func (r *MemoryRegistry) Default(ctx context.Context) (Workspace, AgentFactory, 
 }
 
 func (r *MemoryRegistry) List(ctx context.Context) ([]Workspace, error) {
-	_ = ctx
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -348,6 +373,11 @@ func cloneRuntimeValue(value any) any {
 	return cloneReflectValue(reflect.ValueOf(value)).Interface()
 }
 
+// cloneReflectValue produces a deep copy of value for use as a RuntimeConfig
+// payload. For exported struct fields it recurses; unexported fields are
+// shallow-copied (the same aliasing as `reflect.Value.Set`). This matches the
+// JSON-like data shape RuntimeConfig is intended to carry; embedding structs
+// with unexported mutable state will share those fields with the source.
 func cloneReflectValue(value reflect.Value) reflect.Value {
 	if !value.IsValid() {
 		return value
@@ -415,9 +445,8 @@ func cloneReflectValue(value reflect.Value) reflect.Value {
 }
 
 type runtimeValueRef struct {
-	typ  reflect.Type
-	kind reflect.Kind
-	ptr  uintptr
+	typ reflect.Type
+	ptr uintptr
 }
 
 func hasRuntimeConfigCycle(cfg map[string]any) bool {
@@ -443,7 +472,7 @@ func detectRuntimeConfigCycle(value reflect.Value, visiting, visited map[runtime
 		if value.IsNil() {
 			return false
 		}
-		ref := runtimeValueRef{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		ref := runtimeValueRef{typ: value.Type(), ptr: value.Pointer()}
 		if _, ok := visiting[ref]; ok {
 			return true
 		}
@@ -460,7 +489,7 @@ func detectRuntimeConfigCycle(value reflect.Value, visiting, visited map[runtime
 		if value.IsNil() {
 			return false
 		}
-		ref := runtimeValueRef{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		ref := runtimeValueRef{typ: value.Type(), ptr: value.Pointer()}
 		if _, ok := visiting[ref]; ok {
 			return true
 		}
@@ -486,7 +515,7 @@ func detectRuntimeConfigCycle(value reflect.Value, visiting, visited map[runtime
 		if value.IsNil() {
 			return false
 		}
-		ref := runtimeValueRef{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		ref := runtimeValueRef{typ: value.Type(), ptr: value.Pointer()}
 		if _, ok := visiting[ref]; ok {
 			return true
 		}

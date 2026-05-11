@@ -1,3 +1,7 @@
+// Package idgen provides identifier generators for orchestrator entities such as
+// tasks, sessions, requests, and events. It exposes a deterministic sequential
+// generator suitable for tests and a production-oriented default generator that
+// combines a monotonic wall-clock component with crypto/rand entropy.
 package idgen
 
 import (
@@ -74,7 +78,7 @@ func (g *defaultGenerator) nextID() string {
 	var entropy [5]byte
 	n, err := rand.Read(entropy[:])
 	if err != nil || n != len(entropy) {
-		panic(fmt.Sprintf("idgen default entropy: %v", err))
+		panic(fmt.Errorf("idgen default entropy: %w", err))
 	}
 
 	return fmt.Sprintf("%016x-%010x", uint64(now), entropy)

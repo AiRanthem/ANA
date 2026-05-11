@@ -198,6 +198,61 @@ func TestParseDirective_MalformedAlias(t *testing.T) {
 	})
 }
 
+func TestParseDirective_PlainTextWithToPrefixWord(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"{tooling update}",
+		"{today is friday}",
+		"{tomato}",
+		"{to123}",
+		"{TOOLING}",
+	}
+
+	for _, input := range cases {
+		input := input
+		t.Run(input, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ParseDirective(input)
+			if err != nil {
+				t.Fatalf("ParseDirective(%q): unexpected error: %v", input, err)
+			}
+			if got.IsExplicit {
+				t.Fatalf("ParseDirective(%q): IsExplicit = true, want false", input)
+			}
+			if got.TargetAlias != "" {
+				t.Fatalf("ParseDirective(%q): TargetAlias = %q, want empty", input, got.TargetAlias)
+			}
+			if got.Payload != input {
+				t.Fatalf("ParseDirective(%q): Payload = %q, want %q", input, got.Payload, input)
+			}
+		})
+	}
+}
+
+func TestParseDirective_BareToAndAdjacentDirective(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"{to",
+		"{to}",
+		"{to#Alice}",
+	}
+
+	for _, input := range cases {
+		input := input
+		t.Run(input, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParseDirective(input)
+			if !errors.Is(err, ErrInvalidRouteDirective) {
+				t.Fatalf("ParseDirective(%q): got err %v, want error Is ErrInvalidRouteDirective", input, err)
+			}
+		})
+	}
+}
+
 func TestParseDirective_PlainTextFallback(t *testing.T) {
 	t.Parallel()
 

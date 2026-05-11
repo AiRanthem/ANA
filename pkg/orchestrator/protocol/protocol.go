@@ -1,3 +1,6 @@
+// Package protocol parses and formats the explicit `{to #alias}` route directive
+// used by orchestrator messages. It is a layer-0 pure package: it does not
+// resolve aliases against the registry, only validates directive syntax.
 package protocol
 
 import (
@@ -84,6 +87,26 @@ func firstNonEmptyLineIndex(lines []string) int {
 }
 
 func appearsLikeDirective(line string) bool {
-	trimmed := strings.TrimLeft(line, " \t")
-	return strings.HasPrefix(strings.ToLower(trimmed), "{to")
+	// Match the leading whitespace class used by routeDirectiveRE (`\s` in Go
+	// regexp covers `[\t\n\f\r ]`). Lines are already split on `\n` and CR is
+	// normalized away, but trimming the rest keeps both code paths consistent.
+	trimmed := strings.TrimLeft(line, " \t\f")
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "{to") {
+		return false
+	}
+	// Distinguish a real directive attempt (e.g. `{to #X}`, `{to}`, `{to#X}`)
+	// from plain text that incidentally starts with the letters "to"
+	// (e.g. `{tooling update}`, `{today}`). Only treat the line as an attempt
+	// when `{to` is followed by whitespace, `#`, `}`, or end of input.
+	rest := lower[len("{to"):]
+	if rest == "" {
+		return true
+	}
+	switch rest[0] {
+	case ' ', '\t', '\f', '#', '}':
+		return true
+	default:
+		return false
+	}
 }
