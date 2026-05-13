@@ -26,7 +26,7 @@ helpers (encoders, dedup keys) so external sinks can plug in.
   sinks. Aborts on the first error to keep semantics fail-fast.
 - `MemorySink` — reference in-memory implementation for tests, exposing
   `Events()` and `Transcripts()` accessors.
-- Sentinels: `ErrSinkClosed`, `ErrSinkBackpressure`.
+- Sentinels: `ErrSinkClosed`, `ErrSinkBackpressure`, `ErrNoSink` (returned by `Multi(...)` write paths when constructed with zero non-nil sinks), `ErrRedactionStructure` (returned by `ApplyRedaction` when the policy drops structural metadata).
 
 ## Contract
 
@@ -74,6 +74,7 @@ helpers (encoders, dedup keys) so external sinks can plug in.
 | `SessionID`  | `SessionID` | Empty for `task.*` events |
 | `RequestID`  | `RequestID` | Empty for `task.*` and `session.*` events |
 | `Type`       | `EventType` | Mirrors `events.Event.Type` (see `DESIGN.md` §8.1) |
+| `Seq`        | `uint64`    | Monotonic per (task, session, request); mirrors `events.Event.Seq` |
 | `OccurredAt` | `time.Time` |       |
 | `Payload`    | `[]byte`    | JSON serialization of the typed payload (see `events/PLAN.md`) |
 | `Schema`     | `string`    | Schema version label (`v1`) for forward compat |
@@ -138,14 +139,16 @@ The `event_summary` JSON has a stable shape:
   reads back from the audit sink (it is write-only from this side), so
   consumers own backward-compat policy.
 
-## Tests to write (no implementation in this pass)
+## Tests
 
 1. `MemorySink` happy path: write events + transcripts, accessors return
    them in insertion order per task.
 2. `Multi` aborts on first underlying failure, downstream sinks not
    contacted past the failed one.
-3. Concurrent writers under `-race` for `MemorySink`.
-4. Closed sink rejects writes with `ErrSinkClosed`.
+3. Transcript input records preserve the fully rendered request shape.
+4. Redaction policy preserves structural metadata.
+5. Concurrent writers under `-race` for `MemorySink`.
+6. Closed sink rejects writes with `ErrSinkClosed`.
 
 ## Out of scope
 
