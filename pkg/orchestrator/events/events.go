@@ -3,8 +3,10 @@ package events
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +128,10 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 		return 0, 0
 	}
 	b.activePublishes.Add(1)
+	defer func() {
+		b.activePublishes.Done()
+		b.mu.Unlock()
+	}()
 	taskSubscribers := b.subscribers[event.TaskID]
 	matchedSubscribers := make([]*subscription, 0, len(taskSubscribers))
 	taskSubscribersAll := make([]*subscription, 0, len(taskSubscribers))
@@ -139,13 +145,11 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 		b.terminal[event.TaskID] = struct{}{}
 		delete(b.subscribers, event.TaskID)
 	}
-	b.mu.Unlock()
-	defer b.activePublishes.Done()
 
 	delivered := 0
 	dropped := 0
 	for _, sub := range matchedSubscribers {
-		switch sub.publish(event) {
+		switch sub.publish(snapshotEventPayload(event)) {
 		case publishDelivered:
 			delivered++
 		case publishDropped:
@@ -159,6 +163,112 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 		}
 	}
 	return delivered, dropped
+}
+
+func snapshotEventPayload(event Event) Event {
+	event.Payload = cloneEventPayload(event.Payload)
+	return event
+}
+
+type payloadVisit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+var jsonNumberType = reflect.TypeOf(json.Number(""))
+
+func cloneEventPayload(payload any) any {
+	if payload == nil {
+		return nil
+	}
+	return clonePayloadValue(reflect.ValueOf(payload), make(map[payloadVisit]struct{})).Interface()
+}
+
+func clonePayloadValue(value reflect.Value, active map[payloadVisit]struct{}) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+	if value.Type() == jsonNumberType {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := clonePayloadValue(value.Elem(), active)
+		wrapped := reflect.New(value.Type()).Elem()
+		wrapped.Set(compatiblePayloadValue(cloned, value.Type(), value.Elem()))
+		return wrapped
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		if value.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		visit := payloadVisit{typ: value.Type(), ptr: value.Pointer()}
+		if _, ok := active[visit]; ok {
+			return value
+		}
+		active[visit] = struct{}{}
+		defer delete(active, visit)
+
+		cloned := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			clonedValue := clonePayloadValue(iter.Value(), active)
+			cloned.SetMapIndex(iter.Key(), compatiblePayloadValue(clonedValue, value.Type().Elem(), iter.Value()))
+		}
+		return cloned
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := payloadVisit{typ: value.Type(), ptr: value.Pointer()}
+		if visit.ptr != 0 {
+			if _, ok := active[visit]; ok {
+				return value
+			}
+			active[visit] = struct{}{}
+			defer delete(active, visit)
+		}
+
+		cloned := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := range value.Len() {
+			clonedValue := clonePayloadValue(value.Index(i), active)
+			cloned.Index(i).Set(compatiblePayloadValue(clonedValue, value.Type().Elem(), value.Index(i)))
+		}
+		return cloned
+	case reflect.Array:
+		cloned := reflect.New(value.Type()).Elem()
+		for i := range value.Len() {
+			clonedValue := clonePayloadValue(value.Index(i), active)
+			cloned.Index(i).Set(compatiblePayloadValue(clonedValue, value.Type().Elem(), value.Index(i)))
+		}
+		return cloned
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return value
+	default:
+		return value
+	}
+}
+
+func compatiblePayloadValue(value reflect.Value, target reflect.Type, fallback reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return fallback
+	}
+	if value.Type().AssignableTo(target) {
+		return value
+	}
+	if value.Type().ConvertibleTo(target) {
+		return value.Convert(target)
+	}
+	return fallback
 }
 
 func (b *inProcessBus) Subscribe(ctx context.Context, options SubscribeOptions) (Subscription, error) {

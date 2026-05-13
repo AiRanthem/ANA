@@ -320,15 +320,17 @@ func Multi(sinks ...Sink) Sink {
 }
 
 type multiSink struct {
-	mu     sync.Mutex
-	closed bool
-	sinks  []Sink
+	mu          sync.Mutex
+	closing     bool
+	closed      bool
+	closedSinks []bool
+	sinks       []Sink
 }
 
 func (s *multiSink) WriteEvent(ctx context.Context, record EventRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closing || s.closed {
 		return fmt.Errorf("write audit event task %q event %q: %w", record.TaskID, record.EventID, ErrSinkClosed)
 	}
 	if err := ctx.Err(); err != nil {
@@ -348,7 +350,7 @@ func (s *multiSink) WriteEvent(ctx context.Context, record EventRecord) error {
 func (s *multiSink) WriteTranscript(ctx context.Context, record TranscriptRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closing || s.closed {
 		return fmt.Errorf("write audit transcript task %q session %q request %q kind %q seq %d: %w", record.TaskID, record.SessionID, record.RequestID, record.Kind, record.Seq, ErrSinkClosed)
 	}
 	if err := ctx.Err(); err != nil {
@@ -374,15 +376,27 @@ func (s *multiSink) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("close audit multi sink: %w", err)
 	}
-	s.closed = true
+	s.closing = true
+	if s.closedSinks == nil {
+		s.closedSinks = make([]bool, len(s.sinks))
+	}
 
 	var errs []error
 	for i, sink := range s.sinks {
+		if s.closedSinks[i] {
+			continue
+		}
 		if err := sink.Close(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("close audit sink %d: %w", i, err))
+			continue
 		}
+		s.closedSinks[i] = true
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	s.closed = true
+	return nil
 }
 
 func preserveRequiredMetadata(original FullyRenderedRequest, redacted FullyRenderedRequest) (FullyRenderedRequest, error) {

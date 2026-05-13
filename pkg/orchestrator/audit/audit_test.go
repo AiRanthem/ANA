@@ -234,6 +234,43 @@ func TestMulti_CloseClosesAllSinksAndJoinsErrors(t *testing.T) {
 	}
 }
 
+func TestMulti_CloseRetriesFailedChildrenUntilAllClose(t *testing.T) {
+	ctx := context.Background()
+	closeErr := errors.New("close failed")
+	first := &stubSink{}
+	second := &stubSink{closeErr: closeErr}
+	third := &stubSink{}
+	sink := Multi(first, second, third)
+
+	err := sink.Close(ctx)
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Close() error = %v, want %v", err, closeErr)
+	}
+	if first.closeCalls != 1 || second.closeCalls != 1 || third.closeCalls != 1 {
+		t.Fatalf("close calls after first close = %d/%d/%d, want 1/1/1", first.closeCalls, second.closeCalls, third.closeCalls)
+	}
+
+	writeErr := sink.WriteEvent(ctx, testEvent("task-1", EventTypeTaskCreated, 1))
+	if !errors.Is(writeErr, ErrSinkClosed) {
+		t.Fatalf("WriteEvent() after partial close error = %v, want ErrSinkClosed", writeErr)
+	}
+
+	second.closeErr = nil
+	if err := sink.Close(ctx); err != nil {
+		t.Fatalf("retry Close() error = %v, want nil", err)
+	}
+	if first.closeCalls != 1 || second.closeCalls != 2 || third.closeCalls != 1 {
+		t.Fatalf("close calls after retry = %d/%d/%d, want 1/2/1", first.closeCalls, second.closeCalls, third.closeCalls)
+	}
+
+	if err := sink.Close(ctx); err != nil {
+		t.Fatalf("idempotent Close() error = %v, want nil", err)
+	}
+	if first.closeCalls != 1 || second.closeCalls != 2 || third.closeCalls != 1 {
+		t.Fatalf("close calls after idempotent close = %d/%d/%d, want 1/2/1", first.closeCalls, second.closeCalls, third.closeCalls)
+	}
+}
+
 func TestMulti_CloseIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	underlying := &stubSink{}

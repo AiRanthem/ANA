@@ -95,6 +95,81 @@ func TestBus_MultipleSubscribersReceiveSameEvent(t *testing.T) {
 	}
 }
 
+func TestBus_PublishSnapshotsMutableJSONPayload(t *testing.T) {
+	ctx := context.Background()
+	bus := NewBus()
+	sub, err := bus.Subscribe(ctx, SubscribeOptions{TaskID: "task-1", BufferSize: 1})
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+	defer sub.Close()
+
+	items := []any{"original"}
+	blob := []byte("original")
+	nested := map[string]any{"name": "original"}
+	payload := map[string]any{
+		"items":  items,
+		"blob":   blob,
+		"nested": nested,
+	}
+	event := testBusEvent("task-1", "", "", EventTypeTaskRunning, 1)
+	event.Payload = payload
+
+	delivered, dropped := bus.Publish(ctx, event)
+	if delivered != 1 || dropped != 0 {
+		t.Fatalf("Publish() delivered/dropped = %d/%d, want 1/0", delivered, dropped)
+	}
+	items[0] = "changed"
+	blob[0] = 'X'
+	nested["name"] = "changed"
+	payload["new"] = "changed"
+
+	got := receiveEvent(t, sub.Events())
+	gotPayload := got.Payload.(map[string]any)
+	if gotPayload["items"].([]any)[0] != "original" {
+		t.Fatalf("items payload = %#v, want original snapshot", gotPayload["items"])
+	}
+	if string(gotPayload["blob"].([]byte)) != "original" {
+		t.Fatalf("blob payload = %q, want original snapshot", gotPayload["blob"])
+	}
+	if gotPayload["nested"].(map[string]any)["name"] != "original" {
+		t.Fatalf("nested payload = %#v, want original snapshot", gotPayload["nested"])
+	}
+	if _, ok := gotPayload["new"]; ok {
+		t.Fatalf("payload contains post-publish key: %#v", gotPayload)
+	}
+}
+
+func TestBus_PublishIsolatesPayloadsBetweenSubscribers(t *testing.T) {
+	ctx := context.Background()
+	bus := NewBus()
+	first, err := bus.Subscribe(ctx, SubscribeOptions{TaskID: "task-1", BufferSize: 1})
+	if err != nil {
+		t.Fatalf("first Subscribe() error = %v", err)
+	}
+	defer first.Close()
+	second, err := bus.Subscribe(ctx, SubscribeOptions{TaskID: "task-1", BufferSize: 1})
+	if err != nil {
+		t.Fatalf("second Subscribe() error = %v", err)
+	}
+	defer second.Close()
+
+	event := testBusEvent("task-1", "", "", EventTypeTaskRunning, 1)
+	event.Payload = map[string]any{"items": []any{"original"}}
+
+	delivered, dropped := bus.Publish(ctx, event)
+	if delivered != 2 || dropped != 0 {
+		t.Fatalf("Publish() delivered/dropped = %d/%d, want 2/0", delivered, dropped)
+	}
+
+	firstPayload := receiveEvent(t, first.Events()).Payload.(map[string]any)
+	secondPayload := receiveEvent(t, second.Events()).Payload.(map[string]any)
+	firstPayload["items"].([]any)[0] = "mutated"
+	if secondPayload["items"].([]any)[0] != "original" {
+		t.Fatalf("second payload = %#v, want isolated original snapshot", secondPayload)
+	}
+}
+
 func TestBus_SubscribeFiltersBySessionAndRequest(t *testing.T) {
 	ctx := context.Background()
 	bus := NewBus()

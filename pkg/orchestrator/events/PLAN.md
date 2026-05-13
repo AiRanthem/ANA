@@ -43,9 +43,18 @@ the engine or invoker, and it drops events under back-pressure.
 - `Publish` enqueues the event to every active subscriber for the given
   `task_id` whose optional `session_id` and `request_id` filters also
   match.
+- Delivery/drop accounting is serialized with the bus subscriber map so a
+  later accepted `Publish` cannot enqueue ahead of an earlier accepted
+  `Publish`.
+- For JSON-like payloads, the bus snapshots mutable values before enqueue.
+  Each subscriber receives its own copy of supported mutable payload shapes:
+  primitives, `json.Number`, `[]byte`, arrays/slices, and maps with string
+  keys. Other payload values are treated as immutable by contract; publishers
+  must not mutate them after calling `Publish`.
 - For each subscriber, if its channel buffer is full, the event is
   dropped for that subscriber and the dropped counter is incremented.
-- `Publish` never blocks. The engine and invoker rely on this property.
+- `Publish` never waits for subscriber reads or external I/O. The engine and
+  invoker rely on this best-effort property.
 
 ### Subscribe path
 
@@ -89,6 +98,9 @@ the engine or invoker, and it drops events under back-pressure.
 - The bus tracks subscribers under a mutex keyed by `(TaskID,
   subscriberID)`. Subscription close is idempotent and safe to race with
   publish.
+- Publishers may race safely; the bus serializes enqueue attempts and gives
+  every subscriber a stable per-publish payload snapshot for supported
+  JSON-like payloads.
 
 ## Edge cases & decisions
 
