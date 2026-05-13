@@ -94,22 +94,29 @@ func (e *SubscriberLaggedError) Unwrap() error {
 }
 
 type inProcessBus struct {
-	mu          sync.Mutex
-	closed      bool
-	nextSubID   uint64
-	subscribers map[idgen.TaskID]map[uint64]*subscription
-	terminal    map[idgen.TaskID]struct{}
+	mu              sync.Mutex
+	closed          bool
+	closeDone       chan struct{}
+	activePublishes sync.WaitGroup
+	nextSubID       uint64
+	subscribers     map[idgen.TaskID]map[uint64]*subscription
+	terminal        map[idgen.TaskID]struct{}
 }
 
 func NewBus() Bus {
 	return &inProcessBus{
+		closeDone:   make(chan struct{}),
 		subscribers: make(map[idgen.TaskID]map[uint64]*subscription),
 		terminal:    make(map[idgen.TaskID]struct{}),
 	}
 }
 
 func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
-	if ctx.Err() != nil || event.TaskID == "" {
+	if event.TaskID == "" {
+		return 0, 0
+	}
+	terminal := isTerminalTaskEvent(event.Type)
+	if ctx.Err() != nil && !terminal {
 		return 0, 0
 	}
 
@@ -118,6 +125,7 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 		b.mu.Unlock()
 		return 0, 0
 	}
+	b.activePublishes.Add(1)
 	taskSubscribers := b.subscribers[event.TaskID]
 	matchedSubscribers := make([]*subscription, 0, len(taskSubscribers))
 	taskSubscribersAll := make([]*subscription, 0, len(taskSubscribers))
@@ -127,19 +135,20 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 			matchedSubscribers = append(matchedSubscribers, sub)
 		}
 	}
-	terminal := isTerminalTaskEvent(event.Type)
 	if terminal {
 		b.terminal[event.TaskID] = struct{}{}
 		delete(b.subscribers, event.TaskID)
 	}
 	b.mu.Unlock()
+	defer b.activePublishes.Done()
 
 	delivered := 0
 	dropped := 0
 	for _, sub := range matchedSubscribers {
-		if sub.publish(event) {
+		switch sub.publish(event) {
+		case publishDelivered:
 			delivered++
-		} else {
+		case publishDropped:
 			dropped++
 		}
 	}
@@ -153,9 +162,6 @@ func (b *inProcessBus) Publish(ctx context.Context, event Event) (int, int) {
 }
 
 func (b *inProcessBus) Subscribe(ctx context.Context, options SubscribeOptions) (Subscription, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("subscribe task %q: %w", options.TaskID, err)
-	}
 	if options.TaskID == "" {
 		return nil, fmt.Errorf("subscribe task: %w", ErrSubscribeUnknownTask)
 	}
@@ -171,6 +177,9 @@ func (b *inProcessBus) Subscribe(ctx context.Context, options SubscribeOptions) 
 	if _, ended := b.terminal[options.TaskID]; ended {
 		return nil, fmt.Errorf("subscribe task %q: %w", options.TaskID, ErrSubscribeUnknownTask)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("subscribe task %q: %w", options.TaskID, err)
+	}
 
 	b.nextSubID++
 	sub := newSubscription(b, b.nextSubID, options)
@@ -182,13 +191,14 @@ func (b *inProcessBus) Subscribe(ctx context.Context, options SubscribeOptions) 
 }
 
 func (b *inProcessBus) Close(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("close event bus: %w", err)
-	}
-
 	b.mu.Lock()
 	if b.closed {
+		closeDone := b.closeDone
 		b.mu.Unlock()
+		<-closeDone
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("close event bus: %w", err)
+		}
 		return nil
 	}
 	b.closed = true
@@ -199,10 +209,16 @@ func (b *inProcessBus) Close(ctx context.Context) error {
 		}
 	}
 	b.subscribers = make(map[idgen.TaskID]map[uint64]*subscription)
+	closeDone := b.closeDone
 	b.mu.Unlock()
 
+	b.activePublishes.Wait()
 	for _, sub := range subscribers {
 		sub.close()
+	}
+	close(closeDone)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("close event bus: %w", err)
 	}
 	return nil
 }
@@ -286,15 +302,23 @@ func (s *subscription) matches(event Event) bool {
 	return true
 }
 
-func (s *subscription) publish(event Event) bool {
+type publishStatus int
+
+const (
+	publishInactive publishStatus = iota
+	publishDelivered
+	publishDropped
+)
+
+func (s *subscription) publish(event Event) publishStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return false
+		return publishInactive
 	}
 	select {
 	case s.events <- event:
-		return true
+		return publishDelivered
 	default:
 		dropped := s.dropped.Add(1)
 		err := &SubscriberLaggedError{
@@ -318,7 +342,7 @@ func (s *subscription) publish(event Event) bool {
 			default:
 			}
 		}
-		return false
+		return publishDropped
 	}
 }
 

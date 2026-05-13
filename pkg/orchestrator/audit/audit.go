@@ -2,10 +2,12 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 	"time"
@@ -128,6 +130,22 @@ type AttachmentMetadata struct {
 	RedactionTag string            `json:"redaction_tag,omitempty"`
 }
 
+type UsageSummary struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// EventSummary is the stable JSON payload stored for request outcome summaries.
+type EventSummary struct {
+	Usage        UsageSummary `json:"usage"`
+	FinishReason string       `json:"finish_reason"`
+	ToolCalls    int          `json:"tool_calls"`
+	ToolResults  int          `json:"tool_results"`
+	Error        *string      `json:"error"`
+	DurationMS   int64        `json:"duration_ms"`
+}
+
 type RedactionPolicy interface {
 	RedactRequest(FullyRenderedRequest) (FullyRenderedRequest, error)
 }
@@ -139,11 +157,18 @@ func (f RedactionPolicyFunc) RedactRequest(request FullyRenderedRequest) (FullyR
 }
 
 func ApplyRedaction(request FullyRenderedRequest, policy RedactionPolicy) (FullyRenderedRequest, error) {
-	if policy == nil {
-		return request, nil
+	original, err := cloneFullyRenderedRequest(request)
+	if err != nil {
+		return FullyRenderedRequest{}, fmt.Errorf("redact audit request: %w", err)
 	}
-	original := cloneFullyRenderedRequest(request)
-	redacted, err := policy.RedactRequest(cloneFullyRenderedRequest(request))
+	if policy == nil {
+		return original, nil
+	}
+	policyInput, err := cloneFullyRenderedRequest(request)
+	if err != nil {
+		return FullyRenderedRequest{}, fmt.Errorf("redact audit request: %w", err)
+	}
+	redacted, err := policy.RedactRequest(policyInput)
 	if err != nil {
 		return FullyRenderedRequest{}, fmt.Errorf("redact audit request: %w", err)
 	}
@@ -186,7 +211,8 @@ func NewOutputTranscript(taskID idgen.TaskID, sessionID idgen.SessionID, request
 	}
 }
 
-func NewEventSummaryTranscript(taskID idgen.TaskID, sessionID idgen.SessionID, requestID idgen.RequestID, summary any, seq uint64, createdAt time.Time) (TranscriptRecord, error) {
+// NewEventSummaryTranscript marshals a request outcome summary into an audit transcript.
+func NewEventSummaryTranscript(taskID idgen.TaskID, sessionID idgen.SessionID, requestID idgen.RequestID, summary EventSummary, seq uint64, createdAt time.Time) (TranscriptRecord, error) {
 	content, err := json.Marshal(summary)
 	if err != nil {
 		return TranscriptRecord{}, fmt.Errorf("marshal event summary transcript: %w", err)
@@ -290,14 +316,24 @@ func Multi(sinks ...Sink) Sink {
 			filtered = append(filtered, sink)
 		}
 	}
-	return multiSink{sinks: filtered}
+	return &multiSink{sinks: filtered}
 }
 
 type multiSink struct {
-	sinks []Sink
+	mu     sync.Mutex
+	closed bool
+	sinks  []Sink
 }
 
-func (s multiSink) WriteEvent(ctx context.Context, record EventRecord) error {
+func (s *multiSink) WriteEvent(ctx context.Context, record EventRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("write audit event task %q event %q: %w", record.TaskID, record.EventID, ErrSinkClosed)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("write audit event task %q event %q: %w", record.TaskID, record.EventID, err)
+	}
 	if len(s.sinks) == 0 {
 		return fmt.Errorf("write audit event task %q event %q: %w", record.TaskID, record.EventID, ErrNoSink)
 	}
@@ -309,7 +345,15 @@ func (s multiSink) WriteEvent(ctx context.Context, record EventRecord) error {
 	return nil
 }
 
-func (s multiSink) WriteTranscript(ctx context.Context, record TranscriptRecord) error {
+func (s *multiSink) WriteTranscript(ctx context.Context, record TranscriptRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("write audit transcript task %q session %q request %q kind %q seq %d: %w", record.TaskID, record.SessionID, record.RequestID, record.Kind, record.Seq, ErrSinkClosed)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("write audit transcript task %q session %q request %q kind %q seq %d: %w", record.TaskID, record.SessionID, record.RequestID, record.Kind, record.Seq, err)
+	}
 	if len(s.sinks) == 0 {
 		return fmt.Errorf("write audit transcript task %q session %q request %q kind %q seq %d: %w", record.TaskID, record.SessionID, record.RequestID, record.Kind, record.Seq, ErrNoSink)
 	}
@@ -321,13 +365,24 @@ func (s multiSink) WriteTranscript(ctx context.Context, record TranscriptRecord)
 	return nil
 }
 
-func (s multiSink) Close(ctx context.Context) error {
+func (s *multiSink) Close(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("close audit multi sink: %w", err)
+	}
+	s.closed = true
+
+	var errs []error
 	for i, sink := range s.sinks {
 		if err := sink.Close(ctx); err != nil {
-			return fmt.Errorf("close audit sink %d: %w", i, err)
+			errs = append(errs, fmt.Errorf("close audit sink %d: %w", i, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func preserveRequiredMetadata(original FullyRenderedRequest, redacted FullyRenderedRequest) (FullyRenderedRequest, error) {
@@ -345,10 +400,19 @@ func preserveRequiredMetadata(original FullyRenderedRequest, redacted FullyRende
 	redacted.AgentKey = original.AgentKey
 	redacted.RuntimeType = original.RuntimeType
 	redacted.RuntimeKind = original.RuntimeKind
-	redacted.PromptDiagnostics = cloneAnyMap(redacted.PromptDiagnostics)
+	promptDiagnostics, err := clonePromptDiagnostics(redacted.PromptDiagnostics)
+	if err != nil {
+		return FullyRenderedRequest{}, fmt.Errorf("redact audit request: %w", err)
+	}
+	redacted.PromptDiagnostics = promptDiagnostics
 	redacted.RegistrySnapshot = append(json.RawMessage(nil), redacted.RegistrySnapshot...)
-	redacted.RegistryReference = original.RegistryReference
-	redacted.TemplateVersion = original.TemplateVersion
+	if hasStableRegistryReference(original) {
+		if redacted.RegistryReference != original.RegistryReference || redacted.TemplateVersion != original.TemplateVersion {
+			return FullyRenderedRequest{}, fmt.Errorf("redact audit request changed stable registry reference/template from %q/%q to %q/%q: %w", original.RegistryReference, original.TemplateVersion, redacted.RegistryReference, redacted.TemplateVersion, ErrRedactionStructure)
+		}
+		redacted.RegistryReference = original.RegistryReference
+		redacted.TemplateVersion = original.TemplateVersion
+	}
 	redacted.Metadata = cloneStringMap(redacted.Metadata)
 	for i := range redacted.Inputs {
 		redacted.Inputs[i].Role = original.Inputs[i].Role
@@ -356,19 +420,62 @@ func preserveRequiredMetadata(original FullyRenderedRequest, redacted FullyRende
 		redacted.Inputs[i].SizeBytes = original.Inputs[i].SizeBytes
 		redacted.Inputs[i].SourceReference = original.Inputs[i].SourceReference
 		redacted.Inputs[i].ContentReference = original.Inputs[i].ContentReference
-		redacted.Inputs[i].Metadata = cloneStringMap(original.Inputs[i].Metadata)
+		redacted.Inputs[i].Metadata = cloneStringMap(redacted.Inputs[i].Metadata)
 	}
 	for i := range redacted.Attachments {
 		redacted.Attachments[i].Kind = original.Attachments[i].Kind
 		redacted.Attachments[i].Reference = original.Attachments[i].Reference
 		redacted.Attachments[i].SizeBytes = original.Attachments[i].SizeBytes
 		redacted.Attachments[i].Digest = original.Attachments[i].Digest
-		redacted.Attachments[i].Metadata = cloneStringMap(original.Attachments[i].Metadata)
+		redacted.Attachments[i].Metadata = cloneStringMap(redacted.Attachments[i].Metadata)
+	}
+	if err := validateRedactionStructure(original, redacted); err != nil {
+		return FullyRenderedRequest{}, err
 	}
 	return redacted, nil
 }
 
-func cloneFullyRenderedRequest(request FullyRenderedRequest) FullyRenderedRequest {
+func validateRedactionStructure(original FullyRenderedRequest, redacted FullyRenderedRequest) error {
+	for i, input := range redacted.Inputs {
+		if input.Content != original.Inputs[i].Content && !hasRedactionMarker(input.Redacted, input.RedactionTag) {
+			return fmt.Errorf("redact audit request input %d role %q kind %q changed content without redaction marker: %w", i, original.Inputs[i].Role, original.Inputs[i].Kind, ErrRedactionStructure)
+		}
+		if input.Content != "" || input.ContentReference != "" || hasRedactionMarker(input.Redacted, input.RedactionTag) {
+			continue
+		}
+		return fmt.Errorf("redact audit request input %d role %q kind %q removed content/reference/redaction marker: %w", i, original.Inputs[i].Role, original.Inputs[i].Kind, ErrRedactionStructure)
+	}
+	for i, attachment := range redacted.Attachments {
+		if attachment.Name != original.Attachments[i].Name && !hasRedactionMarker(attachment.Redacted, attachment.RedactionTag) {
+			return fmt.Errorf("redact audit request attachment %d kind %q changed name without redaction marker: %w", i, original.Attachments[i].Kind, ErrRedactionStructure)
+		}
+		if attachment.Name != "" || attachment.Reference != "" || attachment.Digest != "" || hasRedactionMarker(attachment.Redacted, attachment.RedactionTag) {
+			continue
+		}
+		return fmt.Errorf("redact audit request attachment %d kind %q removed name/reference/digest/redaction marker: %w", i, original.Attachments[i].Kind, ErrRedactionStructure)
+	}
+	if hasRegistryContext(original) && !hasRegistryContext(redacted) {
+		return fmt.Errorf("redact audit request removed registry snapshot/reference context: %w", ErrRedactionStructure)
+	}
+	if len(original.RegistrySnapshot) > 0 && !hasStableRegistryReference(redacted) && !bytes.Equal(redacted.RegistrySnapshot, original.RegistrySnapshot) {
+		return fmt.Errorf("redact audit request changed registry snapshot without stable registry reference: %w", ErrRedactionStructure)
+	}
+	return nil
+}
+
+func hasRedactionMarker(redacted bool, tag string) bool {
+	return redacted && tag != ""
+}
+
+func hasRegistryContext(request FullyRenderedRequest) bool {
+	return len(request.RegistrySnapshot) > 0 || (request.TemplateVersion != "" && request.RegistryReference != "")
+}
+
+func hasStableRegistryReference(request FullyRenderedRequest) bool {
+	return request.TemplateVersion != "" && request.RegistryReference != ""
+}
+
+func cloneFullyRenderedRequest(request FullyRenderedRequest) (FullyRenderedRequest, error) {
 	clone := request
 	clone.Inputs = make([]RenderedInputPart, len(request.Inputs))
 	for i, part := range request.Inputs {
@@ -380,10 +487,14 @@ func cloneFullyRenderedRequest(request FullyRenderedRequest) FullyRenderedReques
 		clone.Attachments[i] = attachment
 		clone.Attachments[i].Metadata = cloneStringMap(attachment.Metadata)
 	}
-	clone.PromptDiagnostics = cloneAnyMap(request.PromptDiagnostics)
+	promptDiagnostics, err := clonePromptDiagnostics(request.PromptDiagnostics)
+	if err != nil {
+		return FullyRenderedRequest{}, err
+	}
+	clone.PromptDiagnostics = promptDiagnostics
 	clone.RegistrySnapshot = append(json.RawMessage(nil), request.RegistrySnapshot...)
 	clone.Metadata = cloneStringMap(request.Metadata)
-	return clone
+	return clone, nil
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
@@ -397,66 +508,135 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func cloneAnyMap(in map[string]any) map[string]any {
+func clonePromptDiagnostics(in map[string]any) (map[string]any, error) {
 	if in == nil {
-		return nil
+		return nil, nil
 	}
 	out := make(map[string]any, len(in))
 	for key, value := range in {
-		out[key] = cloneAnyValue(value)
+		cloned, err := clonePromptDiagnosticValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("clone prompt diagnostics key %q: %w", key, err)
+		}
+		out[key] = cloned
 	}
-	return out
+	return out, nil
 }
 
-func cloneAnyValue(value any) any {
+func clonePromptDiagnosticValue(value any) (any, error) {
 	if value == nil {
-		return nil
+		return nil, nil
 	}
-	return cloneReflectValue(reflect.ValueOf(value)).Interface()
+	cloned, err := cloneJSONLikeValue(reflect.ValueOf(value), make(map[cloneVisit]struct{}))
+	if err != nil {
+		return nil, err
+	}
+	return cloned.Interface(), nil
 }
 
-func cloneReflectValue(value reflect.Value) reflect.Value {
+type cloneVisit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+var jsonNumberType = reflect.TypeOf(json.Number(""))
+
+func cloneJSONLikeValue(value reflect.Value, active map[cloneVisit]struct{}) (reflect.Value, error) {
 	if !value.IsValid() {
-		return value
+		return value, nil
+	}
+	if value.Type() == jsonNumberType {
+		if err := validateJSONNumber(value.Interface().(json.Number)); err != nil {
+			return reflect.Value{}, err
+		}
+		return value, nil
 	}
 
 	switch value.Kind() {
 	case reflect.Interface:
 		if value.IsNil() {
-			return reflect.Zero(value.Type())
+			return reflect.Zero(value.Type()), nil
 		}
-		cloned := cloneReflectValue(value.Elem())
+		cloned, err := cloneJSONLikeValue(value.Elem(), active)
+		if err != nil {
+			return reflect.Value{}, err
+		}
 		wrapped := reflect.New(value.Type()).Elem()
 		wrapped.Set(cloned)
-		return wrapped
+		return wrapped, nil
 	case reflect.Map:
 		if value.IsNil() {
-			return reflect.Zero(value.Type())
+			return reflect.Zero(value.Type()), nil
 		}
+		if value.Type().Key().Kind() != reflect.String {
+			return reflect.Value{}, fmt.Errorf("unsupported prompt diagnostics map key type %s: %w", value.Type().Key(), ErrRedactionStructure)
+		}
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		if _, ok := active[visit]; ok {
+			return reflect.Value{}, fmt.Errorf("unsupported cyclic prompt diagnostics map %s: %w", value.Type(), ErrRedactionStructure)
+		}
+		active[visit] = struct{}{}
+		defer delete(active, visit)
+
 		cloned := reflect.MakeMapWithSize(value.Type(), value.Len())
 		iter := value.MapRange()
 		for iter.Next() {
-			cloned.SetMapIndex(cloneReflectValue(iter.Key()), cloneReflectValue(iter.Value()))
+			clonedValue, err := cloneJSONLikeValue(iter.Value(), active)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			cloned.SetMapIndex(iter.Key(), clonedValue)
 		}
-		return cloned
+		return cloned, nil
 	case reflect.Slice:
 		if value.IsNil() {
-			return reflect.Zero(value.Type())
+			return reflect.Zero(value.Type()), nil
+		}
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		if visit.ptr != 0 {
+			if _, ok := active[visit]; ok {
+				return reflect.Value{}, fmt.Errorf("unsupported cyclic prompt diagnostics slice %s: %w", value.Type(), ErrRedactionStructure)
+			}
+			active[visit] = struct{}{}
+			defer delete(active, visit)
 		}
 		cloned := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
 		for i := range value.Len() {
-			cloned.Index(i).Set(cloneReflectValue(value.Index(i)))
+			clonedValue, err := cloneJSONLikeValue(value.Index(i), active)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			cloned.Index(i).Set(clonedValue)
 		}
-		return cloned
-	case reflect.Array:
-		cloned := reflect.New(value.Type()).Elem()
-		for i := range value.Len() {
-			cloned.Index(i).Set(cloneReflectValue(value.Index(i)))
+		return cloned, nil
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return value, nil
+	case reflect.Float32, reflect.Float64:
+		floatValue := value.Float()
+		if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+			return reflect.Value{}, fmt.Errorf("unsupported non-finite prompt diagnostics float %s: %w", value.Type(), ErrRedactionStructure)
 		}
-		return cloned
+		return value, nil
 	default:
-		return value
+		return reflect.Value{}, fmt.Errorf("unsupported prompt diagnostics value type %s: %w", value.Type(), ErrRedactionStructure)
 	}
+}
+
+func validateJSONNumber(number json.Number) error {
+	literal := number.String()
+	if !json.Valid([]byte(literal)) {
+		return fmt.Errorf("unsupported prompt diagnostics json.Number %q is not a valid JSON number: %w", literal, ErrRedactionStructure)
+	}
+	floatValue, err := number.Float64()
+	if err != nil {
+		return fmt.Errorf("unsupported prompt diagnostics json.Number %q: %v: %w", literal, err, ErrRedactionStructure)
+	}
+	if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+		return fmt.Errorf("unsupported non-finite prompt diagnostics json.Number %q: %w", literal, ErrRedactionStructure)
+	}
+	return nil
 }
 
 func cloneEventRecord(record EventRecord) EventRecord {

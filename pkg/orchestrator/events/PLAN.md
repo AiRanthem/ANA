@@ -62,6 +62,13 @@ the engine or invoker, and it drops events under back-pressure.
 - `Bus.Close` notifies all subscribers (closes their `Events()` channels)
   and drains in-flight publishes. After `Close`, further `Publish` calls
   return zero counts; further `Subscribe` calls return `ErrBusClosed`.
+- Close first gates the bus under the subscriber map mutex so no new publish
+  can take a subscriber snapshot, then waits for publishes that already took
+  a snapshot to finish delivery/drop accounting before closing subscriber
+  channels. If the caller's context is already canceled, the same local close
+  sequence still runs and `Close` returns the context error afterward.
+  Concurrent and repeated callers wait for that close sequence to finish
+  before returning their own context result.
 
 ## Drop policy
 
@@ -89,10 +96,17 @@ the engine or invoker, and it drops events under back-pressure.
   drop counter. Drops are independent.
 - Subscribing after the task ended: returns `ErrSubscribeUnknownTask`. The
   caller can fall back to `Wait` for the final result.
+- Subscribe validates `TaskID` before consulting `ctx`, and a closed bus
+  returns `ErrBusClosed` even when the caller's context is canceled. On an
+  active bus with a valid task id, a canceled context returns the context
+  error.
 - Publishing with `task_id == ""`: the bus ignores the publish (zero
   delivered, zero dropped). The `Bus.Publish` signature has no error
   return because publishers are best-effort; callers MUST validate
-  `task_id` before invoking. Same for an already-cancelled `ctx`.
+  `task_id` before invoking.
+- Publishing with an already-canceled `ctx` suppresses non-terminal events.
+  Terminal task events still mark the task terminal, attempt delivery/drop
+  accounting, and close subscribers.
 - Engine shutdown: `Bus.Close` is called by the orchestrator's shutdown
   path; existing subscribers see channel close.
 
